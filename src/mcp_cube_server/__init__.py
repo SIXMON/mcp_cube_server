@@ -36,6 +36,26 @@ def main():
     parser.add_argument(
         "--log_level", required=False, default="INFO", help="Logging level"
     )
+    parser.add_argument(
+        "--output_dir",
+        required=False,
+        default=os.getenv("CUBE_OUTPUT_DIR"),
+        help="Directory where large query results are written (CSV/JSON). Defaults to a temp dir.",
+    )
+    parser.add_argument(
+        "--auto_file_rows",
+        required=False,
+        type=int,
+        default=int(os.getenv("CUBE_AUTO_FILE_ROWS", "1000")),
+        help="Row count above which read_data writes a file instead of inlining. Default 1000.",
+    )
+    parser.add_argument(
+        "--max_inline_chars",
+        required=False,
+        type=int,
+        default=int(os.getenv("CUBE_MAX_INLINE_CHARS", "100000")),
+        help="Serialized-size (chars) above which read_data writes a file instead of inlining. Default 100000.",
+    )
 
     dotenv.load_dotenv()
 
@@ -57,10 +77,6 @@ def main():
     args, unknown = parser.parse_known_args()
     additional_kwargs = args_to_kwargs(unknown)
 
-    token_payload = json.loads(required["token_payload"])
-    for key, value in additional_kwargs.items():
-        token_payload[key] = value
-
     logger = logging.getLogger(__name__)
     logger.propagate = False
     logger.setLevel(args.log_level)
@@ -79,18 +95,33 @@ def main():
         logger.addHandler(file_handler)
 
     try:
-        credentials = {
-            "endpoint": args.endpoint,
-            "api_secret": args.api_secret,
-            "token_payload": token_payload,
-        }
+        token_payload = json.loads(required["token_payload"])
+        for key, value in additional_kwargs.items():
+            token_payload[key] = value
     except json.JSONDecodeError:
-        logger.error("Invalid JSON in token_payload: %s", args.token_payload)
+        logger.error("Invalid JSON in CUBE_TOKEN_PAYLOAD / --token_payload")
         return
+
+    if additional_kwargs:
+        # Unknown --flags are injected as JWT claims (Cube security context). Surface which ones.
+        logger.info("Extra JWT claims from CLI flags: %s", ", ".join(sorted(additional_kwargs)))
+
+    credentials = {
+        "endpoint": args.endpoint,
+        "api_secret": args.api_secret,
+        "token_payload": token_payload,
+    }
+
+    config = {
+        "output_dir": args.output_dir,
+        "auto_file_rows": args.auto_file_rows,
+        "max_inline_chars": args.max_inline_chars,
+    }
 
     server.main(
         credentials,
         logger,
+        config,
     )
 
 

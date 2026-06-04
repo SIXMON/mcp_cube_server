@@ -1,9 +1,0 @@
-2025-01-29 14:05:54,071 - mcp_cube_server - INFO - Starting Cube MCP server
-2025-01-29 14:06:16,132 - mcp_cube_server - INFO - read_data called with query: {"measures": ["vulnerabilities.compensated_count"], "dimensions": ["workloads.operating_system_platform"], "timeDimensions": [], "filters": [], "limit": 500, "offset": 0, "order": {}, "ungrouped": false}
-2025-01-29 14:06:21,338 - mcp_cube_server - ERROR - Error in read_data: Continue wait
-
-None
-2025-01-29 14:06:21,338 - mcp_cube_server - ERROR - Full response: {"error": "Continue wait"}
-2025-01-29 14:06:25,433 - mcp_cube_server - INFO - read_data called with query: {"measures": ["vulnerabilities.compensated_count"], "dimensions": ["workloads.operating_system_platform"], "timeDimensions": [], "filters": [], "limit": 500, "offset": 0, "order": {}, "ungrouped": false}
-2025-01-29 14:06:26,413 - mcp_cube_server - INFO - read_data returned 3 rows
-2025-01-29 14:06:26,415 - mcp_cube_server - INFO - Added results as resource with ID: 57d9e33e-8cbe-4def-b9f5-007ad4dfdaff

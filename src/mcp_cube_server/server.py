@@ -1,7 +1,6 @@
 from __future__ import annotations
-from typing import Annotated, Any, Literal, Optional, Union
+from typing import Any, Literal, Optional, Union
 from mcp.server.fastmcp import FastMCP
-from mcp.types import TextContent, EmbeddedResource, TextResourceContents
 import jwt
 from pydantic import BaseModel, Field
 import requests
@@ -10,79 +9,188 @@ import logging
 import yaml
 import uuid
 import time
+import os
+import re
+import csv
+import math
+import difflib
+import tempfile
+import unicodedata
 
 
 def data_to_yaml(data: Any) -> str:
-    return yaml.dump(data, indent=2, sort_keys=False)
+    return yaml.dump(data, indent=2, sort_keys=False, allow_unicode=True)
+
+
+# ---------------------------------------------------------------------------
+# Text utilities for search (accent-folding, tokenization)
+# ---------------------------------------------------------------------------
+def _fold(text: Optional[str]) -> str:
+    """Lowercase and strip diacritics so 'référence' matches 'reference'."""
+    if not text:
+        return ""
+    norm = unicodedata.normalize("NFKD", text)
+    return norm.encode("ascii", "ignore").decode("ascii").lower()
+
+
+def _stem(token: str) -> str:
+    """Crude, language-agnostic de-pluralization, applied to BOTH index and query
+
+    - '-es' after a sibilant (s/x/z) → drop 'es' (statuses->status, boxes->box, addresses->address)
+    - trailing 's'/'x' on tokens >= 4 chars → drop it (orders->order, status->statu)
+    Deliberately applied symmetrically: it trades a little precision for recall, which is the right
+    bias for a lexical search that an agent then narrows with describe_cube()."""
+    if len(token) >= 5 and token.endswith("es") and token[-3] in "sxz":
+        token = token[:-2]
+    if len(token) >= 4 and token[-1] in ("s", "x"):
+        token = token[:-1]
+    return token
+
+
+def _terms(text: Optional[str]) -> set[str]:
+    return {_stem(t) for t in re.findall(r"[a-z0-9]+", _fold(text))}
+
+
+# Common French/English function words that match almost everything and only add noise to search.
+_STOPWORDS = {
+    "de", "des", "du", "le", "la", "les", "un", "une", "et", "ou", "au", "aux", "en", "par", "pour",
+    "sur", "dans", "avec", "sans", "ce", "ces", "cet", "cette", "son", "sa", "ses", "mon", "ma", "mes",
+    "ton", "ta", "tes", "qui", "que", "quoi", "dont", "est", "ne", "pas", "plus", "moins", "chaque",
+    "tous", "toute", "toutes", "tout", "vs", "via", "selon", "entre",
+    "the", "of", "by", "per", "for", "to", "in", "on", "and", "or", "an", "is", "are", "as", "at",
+    "with", "without", "from", "each", "all", "into", "over",
+}
+
+
+def _query_terms(query: str) -> set[str]:
+    """Tokenize a search query, dropping 1-char tokens and stopwords.
+
+    Returns an empty set for an all-stopword query (so search reports 'no match, reformulate'
+    rather than matching boilerplate everywhere)."""
+    return {t for t in _terms(query) if len(t) >= 2 and t not in _STOPWORDS}
 
 
 class CubeClient:
-    Route = Literal["meta", "load"]
+    Route = Literal["meta", "load", "sql"]
     max_wait_time = 10
     request_backoff = 1
+    request_timeout = 30  # seconds — avoid indefinite hangs (cf. ebragas fork)
+    token_ttl = 3600  # seconds — generated tokens carry iat/exp
+    meta_ttl = 60  # seconds — /meta is cached to avoid a round-trip on every tool call
 
     def __init__(self, endpoint: str, api_secret: str, token_payload: dict, logger: logging.Logger):
         self.endpoint = endpoint
         self.api_secret = api_secret
-        self.token_payload = token_payload
+        self.token_payload = token_payload or {}
         self.token = None
         self.logger = logger
+        self._meta_cache: Optional[dict] = None
+        self._meta_at = 0.0
         self._refresh_token()
-        self.meta = self.describe()
+        meta = self._fetch_meta()
+        if meta.get("error"):
+            logger.warning("Cube /meta unavailable at startup: %s", meta.get("error"))
 
+    # -- auth ----------------------------------------------------------------
     def _generate_token(self):
-        return jwt.encode(self.token_payload, self.api_secret, algorithm="HS256")
+        payload = dict(self.token_payload)
+        if "exp" not in payload:  # don't override a caller-supplied expiry
+            now = int(time.time())
+            payload.setdefault("iat", now)
+            payload["exp"] = now + self.token_ttl
+        return jwt.encode(payload, self.api_secret, algorithm="HS256")
 
     def _refresh_token(self):
         self.token = self._generate_token()
 
-    def _request(self, route: Route, **params):
+    # -- http ----------------------------------------------------------------
+    @staticmethod
+    def _parse(response) -> dict:
+        """Parse a response body as JSON once, degrading gracefully on non-JSON bodies."""
+        try:
+            return response.json()
+        except ValueError:
+            return {"error": f"Non-JSON response (HTTP {response.status_code})", "body": response.text[:500]}
+
+    def _request(self, route: "CubeClient.Route", **params) -> dict:
         request_time = time.time()
-        headers = {"Authorization": self.token}
-        url = f"{self.endpoint if self.endpoint[-1] != '/' else self.endpoint[:-1]}/{route}"
+        headers = {"Authorization": self.token or ""}
+        url = f"{self.endpoint.rstrip('/')}/{route}"
         serialized_params = {k: json.dumps(v) for k, v in params.items()}
 
         try:
-            response = requests.get(url, headers=headers, params=serialized_params)
+            response = requests.get(url, headers=headers, params=serialized_params, timeout=self.request_timeout)
+            payload = self._parse(response)
 
             # Handle "continue wait" responses
-            while response.json().get("error") == "Continue wait":
+            while payload.get("error") == "Continue wait":
                 if time.time() - request_time > self.max_wait_time:
-                    self.logger.error(f"Request timed out after {self.max_wait_time} seconds")
-                    return {"error": "Request timed out. Something may have gone wrong or the request may be too complex."}
-                self.logger.warning(f"Request incomplete, polling again in {self.request_backoff} second(s)")
+                    self.logger.error("Request timed out after %ss", self.max_wait_time)
+                    return {"error": "Request timed out. The request may be too complex."}
+                self.logger.warning("Request incomplete, polling again in %ss", self.request_backoff)
                 time.sleep(self.request_backoff)
-                response = requests.get(url, headers=headers, params=serialized_params)
+                response = requests.get(url, headers=headers, params=serialized_params, timeout=self.request_timeout)
+                payload = self._parse(response)
 
-            # Handle 403 responses by trying to refresh the token once
+            # 403 is usually an auth problem (wrong api_secret / missing security-context claim),
+            # not an expiry. Regenerate the token (picks up a fresh exp) and retry once; if it still
+            # fails the caller sees the error.
             if response.status_code == 403:
-                self.logger.warning("Received 403, attempting token refresh")
+                self.logger.warning("403 from Cube — regenerating token and retrying once (check api_secret / token_payload claims)")
                 self._refresh_token()
-                return requests.get(url, headers=headers, params=serialized_params)
+                headers = {"Authorization": self.token or ""}
+                response = requests.get(url, headers=headers, params=serialized_params, timeout=self.request_timeout)
+                payload = self._parse(response)
 
-            if response.status_code != 200:
-                self.logger.error(f"Request failed with error: {str(response.json().get('error'))}")
-
-            return response.json()
+            if response.status_code != 200 and "error" not in payload:
+                payload = {"error": f"HTTP {response.status_code}", "body": response.text[:500]}
+            return payload
 
         except Exception as e:
-            self.logger.error(f"Request failed with error: {str(e)}")
-            return {"error": f"Request failed: {str(e)}"}
+            self.logger.error("Request failed: %s", e)
+            return {"error": f"Request failed: {e}"}
 
-    def describe(self):
-        return self._request("meta")
+    # -- meta (cached) -------------------------------------------------------
+    def _fetch_meta(self) -> dict:
+        meta = self._request("meta")
+        self._meta_cache = meta
+        self._meta_at = time.time()
+        return meta
 
-    def _cast_numerics(self, response):
+    def describe(self, refresh: bool = False) -> dict:
+        if refresh or self._meta_cache is None or (time.time() - self._meta_at) > self.meta_ttl:
+            return self._fetch_meta()
+        return self._meta_cache
+
+    def cubes(self, refresh: bool = False) -> list[dict]:
+        """Cubes AND views from /meta (views carry type == 'view'), cached for meta_ttl seconds."""
+        meta = self.describe(refresh=refresh)
+        if meta.get("error"):
+            return []
+        return meta.get("cubes", [])
+
+    def measure_agg(self, refresh: bool = False) -> dict[str, Optional[str]]:
+        """Map measure name -> aggType from /meta (the /load annotation omits aggType)."""
+        out: dict[str, Optional[str]] = {}
+        for entry in self.cubes(refresh=refresh):
+            for m in entry.get("measures", []):
+                if m.get("name"):
+                    out[m["name"]] = m.get("aggType")
+        return out
+
+    def sql(self, query: dict) -> dict:
+        """Compile a query to SQL without executing it (dry-run / validation)."""
+        return self._request("sql", query=query)
+
+    def _cast_numerics(self, response: dict) -> dict:
         if response.get("data") and response.get("annotation"):
-            # Find which keys are numeric
             numeric_keys = set()
             dimensions_and_measures = dict(
-                response["annotation"].get("dimensions", {}), **response["annotation"].get("measures", [])
+                response["annotation"].get("dimensions", {}), **response["annotation"].get("measures", {})
             )
             for column_name, column in dimensions_and_measures.items():
                 if column.get("type") == "number":
                     numeric_keys.add(column_name)
-            # Cast numeric values to numbers
             for row in response["data"]:
                 for key in numeric_keys:
                     try:
@@ -93,141 +201,648 @@ class CubeClient:
                         pass
         return response
 
-    def query(self, query, cast_numerics=True):
+    def query(self, query: dict, cast_numerics: bool = True) -> dict:
         response = self._request("load", query=query)
         if cast_numerics:
             response = self._cast_numerics(response)
         return response
 
+    def query_paginated(self, query: dict, page_size: int, max_rows: int, cast_numerics: bool = True) -> dict:
+        """Fetch a large result by paging on offset, transparently working around Cube's per-query
+        row cap. Honors the query's `limit` (None = fetch all up to max_rows) and starting `offset`.
+        Returns {data, annotation, truncated} or {error} (with partial data if a later page failed)."""
+        base = {k: v for k, v in query.items() if k not in ("limit", "offset")}
+        requested = query.get("limit")
+        offset = query.get("offset") or 0
+        all_data: list[dict] = []
+        annotation: dict = {}
+        truncated = False
+        while True:
+            page_limit = page_size
+            if requested is not None:
+                remaining = requested - len(all_data)
+                if remaining <= 0:
+                    break
+                page_limit = min(page_size, remaining)
+            page_limit = min(page_limit, max(1, max_rows - len(all_data)))
+            resp = self.query({**base, "limit": page_limit, "offset": offset}, cast_numerics)
+            if resp.get("error"):
+                if all_data:
+                    return {"data": all_data, "annotation": annotation, "truncated": True, "error": resp["error"]}
+                return {"error": resp["error"]}
+            page = resp.get("data", [])
+            annotation = resp.get("annotation") or annotation
+            all_data.extend(page)
+            if len(page) < page_limit:  # last page reached
+                break
+            offset += len(page)
+            if len(all_data) >= max_rows:
+                truncated = True
+                break
+        return {"data": all_data, "annotation": annotation, "truncated": truncated}
 
-class Filter(BaseModel):
-    dimension: str = Field(..., description="Name of the time dimension")
-    granularity: Literal["second", "minute", "hour", "day", "week", "month", "quarter", "year"] = Field(
-        ..., description="Time granularity"
-    )
-    dateRange: Union[list[str], str] = Field(
-        ...,
-        description="Pair of dates ISO dates representing the start and end of the range. Alternatively, a string representing a relative date range of the form: 'last N days', 'today', 'yesterday', 'last year', etc.",
-    )
 
-    model_config = {"exclude_none": True}
-
-
+# ---------------------------------------------------------------------------
+# Query models
+# ---------------------------------------------------------------------------
 class TimeDimension(BaseModel):
     dimension: str = Field(..., description="Name of the time dimension")
-    granularity: Literal["second", "minute", "hour", "day", "week", "month", "quarter", "year"] = Field(
-        ..., description="Time granularity"
+    granularity: Optional[Literal["second", "minute", "hour", "day", "week", "month", "quarter", "year"]] = Field(
+        None,
+        description="Time bucket to group by (e.g. 'month'). OMIT it to use this time dimension as a "
+        "period filter only (via dateRange) without grouping or adding a column.",
     )
     dateRange: Union[list[str], str] = Field(
         ...,
-        description="Pair of dates ISO dates representing the start and end of the range. Alternatively, a string representing a relative date range of the form: 'last N days', 'today', 'yesterday', 'last year', etc.",
+        description="Pair of ISO dates [start, end], or a relative range string: 'last N days', 'today', 'yesterday', 'last year', etc.",
     )
 
-    model_config = {"exclude_none": True}
+    model_config = {"extra": "forbid"}
+
+
+class Filter(BaseModel):
+    member: str = Field(..., description="Dimension or measure to filter on, e.g. 'orders.status'")
+    operator: Literal[
+        "equals",
+        "notEquals",
+        "contains",
+        "notContains",
+        "startsWith",
+        "endsWith",
+        "gt",
+        "gte",
+        "lt",
+        "lte",
+        "set",
+        "notSet",
+        "inDateRange",
+        "notInDateRange",
+        "beforeDate",
+        "afterDate",
+    ] = Field("equals", description="Filter operator (Cube REST semantics)")
+    values: Optional[list[Union[str, int, float, bool]]] = Field(
+        None, description="Values for the filter. Omit for 'set'/'notSet'."
+    )
+
+    model_config = {"extra": "forbid"}
+
+
+class OutputOptions(BaseModel):
+    format: Literal["csv", "json"] = Field("csv", description="File format when results are written to disk.")
+    to_file: bool = Field(
+        False,
+        description="Force writing the full result to a file and returning only a compact summary. "
+        "Large results are written to a file automatically even when this is false.",
+    )
+
+    model_config = {"extra": "forbid"}
 
 
 class Query(BaseModel):
-
     measures: list[str] = Field([], description="Names of measures to query")
     dimensions: list[str] = Field([], description="Names of dimensions to group by")
     timeDimensions: list[TimeDimension] = Field([], description="Time dimensions to group by")
-    # filters: list[Filter] = Field([], description="Filters to apply to the query")
-    limit: Optional[int] = Field(500, description="Maximum number of rows to return. Defaults to 500")
+    filters: list[Filter] = Field([], description="Filters applied server-side (member/operator/values)")
+    limit: Optional[int] = Field(
+        500,
+        description="Max rows. Defaults to 500. Set higher (or null) to export more: results beyond "
+        "Cube's per-query cap are paginated transparently into a single file.",
+    )
     offset: Optional[int] = Field(0, description="Number of rows to skip. Defaults to 0")
     order: dict[str, Literal["asc", "desc"]] = Field(
         {}, description="Optional ordering of the results. The order is sensitive to the order of keys."
     )
     ungrouped: bool = Field(
         False,
-        description="Return results without grouping by dimensions. Instead, return all rows. This can be useful for fetching a single row by its ID as well.",
+        description="Return ungrouped rows instead of grouping by dimensions. Useful to fetch a single row by id.",
+    )
+    output: Optional[OutputOptions] = Field(
+        None, description="Control how the result is returned (inline vs written to a file)."
+    )
+    dry_run: bool = Field(
+        False,
+        description="Do not execute: return the compiled SQL and the cubes/members used, to validate joins and gauge the query.",
     )
 
-    model_config = {"exclude_none": True}
+    model_config = {"extra": "forbid"}
+
+    @staticmethod
+    def _coerce_value(v):
+        # Cube REST expects filter values as strings; normalize Python bools to JSON-style.
+        if isinstance(v, bool):
+            return "true" if v else "false"
+        return v if isinstance(v, str) else str(v)
+
+    def cube_query(self) -> dict:
+        """Build the dict sent to Cube (excludes MCP-only options like output/dry_run)."""
+        q: dict[str, Any] = {}
+        if self.measures:
+            q["measures"] = self.measures
+        if self.dimensions:
+            q["dimensions"] = self.dimensions
+        if self.timeDimensions:
+            q["timeDimensions"] = [td.model_dump(exclude_none=True) for td in self.timeDimensions]
+        if self.filters:
+            filters = []
+            for f in self.filters:
+                fd: dict[str, Any] = {"member": f.member, "operator": f.operator}
+                if f.values is not None:
+                    fd["values"] = [self._coerce_value(v) for v in f.values]
+                filters.append(fd)
+            q["filters"] = filters
+        # Cube treats limit:0 as "zero rows"; omit non-positive limits so Cube uses its default.
+        if self.limit is not None and self.limit > 0:
+            q["limit"] = self.limit
+        if self.offset and self.offset > 0:
+            q["offset"] = self.offset
+        if self.order:
+            q["order"] = self.order
+        if self.ungrouped:
+            q["ungrouped"] = True
+        return q
 
 
-def main(credentials, logger):
+# ---------------------------------------------------------------------------
+# Meta helpers (shared by discovery tools)
+# ---------------------------------------------------------------------------
+def _entry_type(entry: dict) -> str:
+    """'view' or 'cube'. Cube's /meta tags views with type == 'view'."""
+    return "view" if entry.get("type") == "view" else "cube"
+
+
+def _member_title(m: dict) -> Optional[str]:
+    return m.get("shortTitle") or m.get("title")
+
+
+def _clean(d: dict) -> dict:
+    """Drop None values so the YAML stays terse (no 'agg: null', 'format: null')."""
+    return {k: v for k, v in d.items() if v is not None}
+
+
+def _truncate(text: Optional[str], n: int = 160) -> Optional[str]:
+    if not text:
+        return text
+    text = " ".join(text.split())  # collapse whitespace/newlines
+    return text if len(text) <= n else text[: n - 1].rstrip() + "…"
+
+
+def _catalog(cubes: list[dict]) -> list[dict]:
+    """Lightweight catalog: one small entry per cube/view, views first.
+
+    Descriptions are truncated and member lists reduced to counts so the whole catalog stays well
+    under the token limit even for large models (call describe_cube for the full detail of one)."""
+    out = []
+    for entry in cubes:
+        out.append(
+            _clean(
+                {
+                    "name": entry.get("name"),
+                    "type": _entry_type(entry),
+                    "title": entry.get("title"),
+                    "description": _truncate(entry.get("description")),
+                    "measures": len(entry.get("measures", [])),
+                    "dimensions": len(entry.get("dimensions", [])),
+                }
+            )
+        )
+    # views first, then alphabetical
+    out.sort(key=lambda e: (e["type"] != "view", e["name"] or ""))
+    return out
+
+
+def _describe_one(entry: dict) -> dict:
+    """Full detail for a single cube/view."""
+    etype = _entry_type(entry)
+    desc: dict[str, Any] = {
+        "name": entry.get("name"),
+        "type": etype,
+        "title": entry.get("title"),
+        "description": entry.get("description"),
+        "public": entry.get("public"),
+    }
+    if entry.get("meta"):
+        desc["meta"] = entry.get("meta")  # user-defined meta, e.g. ai_context
+    if entry.get("folders"):
+        desc["folders"] = entry.get("folders")
+    if entry.get("hierarchies"):
+        desc["hierarchies"] = entry.get("hierarchies")
+    if etype == "cube" and entry.get("connectedComponent") is not None:
+        # Joinability hint: cubes sharing this value have at least one join path.
+        desc["connectedComponent"] = entry.get("connectedComponent")
+        desc["joins_hint"] = (
+            "To combine this cube with another (e.g. group a measure here by a dimension of another "
+            "cube), just list members from both cubes in ONE read_data call — Cube auto-resolves the "
+            "join when they share the same connectedComponent. Use dry_run to see/confirm the join path."
+        )
+    desc["measures"] = [
+        _clean(
+            {
+                "name": m.get("name"),
+                "title": _member_title(m),
+                "description": m.get("description"),
+                "agg": m.get("aggType"),
+                "type": m.get("type"),
+                "format": m.get("format"),
+            }
+        )
+        for m in entry.get("measures", [])
+    ]
+    desc["dimensions"] = [
+        _clean(
+            {
+                "name": d.get("name"),
+                "title": _member_title(d),
+                "description": d.get("description"),
+                "type": d.get("type"),
+                "primary_key": d.get("primaryKey"),
+            }
+        )
+        for d in entry.get("dimensions", [])
+    ]
+    if entry.get("segments"):
+        desc["segments"] = [{"name": s.get("name"), "title": _member_title(s)} for s in entry.get("segments", [])]
+    return _clean(desc)
+
+
+def _search(cubes: list[dict], query: str, top_k: int) -> list[dict]:
+    """Weighted full-text scoring over cubes/views and their members.
+
+    Scored per query TERM (not per member) so wide cubes don't accumulate noise, with cube-level
+    fields weighted far above member-level ones. Curated views are boosted.
+    """
+    qterms = _query_terms(query)
+    if not qterms:
+        return []
+
+    # Per-cube term sets (cube-level + members), computed once.
+    indexed = []
+    for entry in cubes:
+        name_t = _terms(entry.get("name"))
+        title_t = _terms(entry.get("title"))
+        desc_t = _terms(entry.get("description"))
+        mem_name_idx: dict[str, str] = {}
+        mem_desc_idx: dict[str, str] = {}
+        for kind in ("measures", "dimensions"):
+            for m in entry.get(kind, []):
+                mname = m.get("name")
+                for t in _terms(m.get("name")) | _terms(m.get("title")) | _terms(m.get("shortTitle")):
+                    mem_name_idx.setdefault(t, mname)
+                for t in _terms(m.get("description")):
+                    mem_desc_idx.setdefault(t, mname)
+        indexed.append((entry, name_t, title_t, desc_t, mem_name_idx, mem_desc_idx))
+
+    # IDF weight per query term: a term present in many cubes is downweighted toward 0; a rare term keeps weight ~1.
+    n = max(1, len(cubes))
+    denom = math.log(n + 1)
+    df = {t: 0 for t in qterms}
+    for _, name_t, title_t, desc_t, mni, mdi in indexed:
+        present = name_t | title_t | desc_t | set(mni) | set(mdi)
+        for t in qterms:
+            if t in present:
+                df[t] += 1
+    idf = {t: (math.log((n + 1) / (df[t] + 1)) / denom if denom else 1.0) for t in qterms}
+
+    results = []
+    for entry, name_t, title_t, desc_t, mem_name_idx, mem_desc_idx in indexed:
+        score = 0.0
+        matched_on: set[str] = set()
+        for t in qterms:
+            w = idf[t]
+            # cube-level: take the single strongest field for this term
+            if t in name_t:
+                score += 6 * w
+                matched_on.add("name")
+            elif t in title_t:
+                score += 5 * w
+                matched_on.add("title")
+            elif t in desc_t:
+                score += 2 * w
+                matched_on.add("description")
+            # member-level: counted once per term, low weight
+            if t in mem_name_idx:
+                score += 2 * w
+                matched_on.add(f"member:{mem_name_idx[t]}")
+            elif t in mem_desc_idx:
+                score += 0.5 * w
+                matched_on.add(f"member:{mem_desc_idx[t]}")
+
+        if score <= 0:
+            continue
+        etype = _entry_type(entry)
+        if etype == "view":
+            score *= 1.5  # prefer curated views when relevance is comparable
+        snippet = (entry.get("description") or entry.get("title") or "")[:200]
+        results.append(
+            {
+                "name": entry.get("name"),
+                "type": etype,
+                "score": round(score, 2),
+                "matched_on": sorted(matched_on)[:6],
+                "snippet": snippet,
+            }
+        )
+    results.sort(key=lambda r: (-r["score"], r["type"] != "view", r["name"]))
+    return results[:top_k]
+
+
+# Aggregation types for which summing per-group values yields a meaningful grand total.
+_ADDITIVE_AGG = {"sum", "count"}
+
+
+def _column_order(annotation: dict, data: list[dict], fallback: list[str]) -> list[str]:
+    """Stable, complete column order: annotation order first, then any extra keys seen in the data.
+
+    Built from the union of all rows' keys (not just data[0]) so heterogeneous rows never lose columns."""
+    ann_order = [
+        *annotation.get("dimensions", {}),
+        *annotation.get("timeDimensions", {}),
+        *annotation.get("measures", {}),
+    ]
+    seen = {k: None for row in data for k in row}  # dict preserves first-seen order (deterministic)
+    if not seen:
+        return [c for c in (ann_order or fallback) if c]
+    # 1) columns the caller explicitly requested, in their order; 2) remaining annotation order; 3) extras.
+    ordered = [c for c in fallback if c in seen]
+    ordered += [c for c in ann_order if c in seen and c not in ordered]
+    ordered += [k for k in seen if k not in ordered]
+    return ordered
+
+
+def _columns(annotation: dict, order: list[str], agg_map: dict) -> list[dict]:
+    """Typed column list for a result. aggType comes from /meta (the /load annotation omits it)."""
+    dims = annotation.get("dimensions", {})
+    meas = annotation.get("measures", {})
+    tds = annotation.get("timeDimensions", {})
+    cols = []
+    for k in order:
+        ann = dims.get(k) or meas.get(k) or tds.get(k) or {}
+        col = {"name": k, "type": ann.get("type")}
+        agg = ann.get("aggType") or agg_map.get(k)
+        if agg:
+            col["agg"] = agg
+        cols.append(col)
+    return cols
+
+
+def _aggregates(data: list[dict], annotation: dict, agg_map: dict) -> dict:
+    """Descriptive stats per numeric measure column. `sum` is reported ONLY for additive measures
+    (sum/count); for avg/ratio/countDistinct/etc. summing would be misleading, so only min/max/count."""
+    out = {}
+    for col in annotation.get("measures", {}):
+        nums = [r[col] for r in data if isinstance(r.get(col), (int, float)) and not isinstance(r.get(col), bool)]
+        if not nums:
+            continue
+        stats = {"min": min(nums), "max": max(nums), "count": len(nums)}
+        if agg_map.get(col) in _ADDITIVE_AGG:
+            stats["sum"] = sum(nums)
+        out[col] = stats
+    return out
+
+
+def _write_result_file(data: list[dict], col_order: list[str], output_dir: str, fmt: str) -> str:
+    """Write the full result to disk (csv/json) and return the absolute path.
+    Results may contain sensitive data, so the directory is 0o700 and files 0o600."""
+    os.makedirs(output_dir, mode=0o700, exist_ok=True)
+    try:
+        os.chmod(output_dir, 0o700)  # tighten even if the dir pre-existed
+    except OSError:
+        pass
+    data_id = uuid.uuid4().hex[:12]
+    path = os.path.join(output_dir, f"cube_{data_id}.{fmt}")
+    # Create with restrictive perms before writing.
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", newline="", encoding="utf-8") as f:
+        if fmt == "csv":
+            w = csv.DictWriter(f, fieldnames=col_order, extrasaction="ignore")
+            w.writeheader()
+            w.writerows(data)
+        else:
+            json.dump(data, f, ensure_ascii=False)
+    return os.path.abspath(path)
+
+
+def _explain_error(error) -> str:
+    """Turn opaque Cube errors into actionable guidance for an agent."""
+    e = str(error)
+    low = e.lower()
+    if "limit" in low and "exceed" in low:
+        return (
+            e + " — Cube caps the number of rows per single query. Set a higher `limit` "
+            "(or `limit: null` for all rows): read_data paginates past the cap and writes one file."
+        )
+    return e
+
+
+def main(credentials, logger, config=None):
+    config = config or {}
+    output_dir = config.get("output_dir") or os.path.join(tempfile.gettempdir(), "mcp_cube_exports")
+    auto_file_rows = int(config.get("auto_file_rows", 1000))
+    max_inline_chars = int(config.get("max_inline_chars", 100_000))
+    sample_rows = int(config.get("sample_rows", 20))
+    page_size = int(config.get("page_size", 50_000))  # stays under Cube's per-query row cap
+    max_export_rows = int(config.get("max_export_rows", 1_000_000))  # safety ceiling for a single export
+
     mcp = FastMCP("Cube.dev")
-
     client = CubeClient(**credentials, logger=logger)
 
+    # -- catalog resource (lightweight; replaces the old monolithic dump) -----
     @mcp.resource("context://data_description")
     def data_description() -> str:
-        """Describe the data available in Cube."""
-        meta = client.describe()
-        if error := meta.get("error"):
-            logger.error("Error in data_description: %s\n\n%s", error, meta.get("stack"))
-            logger.error("Full response: %s", json.dumps(meta))
-            return f"Error: Description of the data is not available: {error}, {meta}"
-
-        description = [
-            {
-                "name": cube.get("name"),
-                "title": cube.get("title"),
-                "description": cube.get("description"),
-                "dimensions": [
-                    {
-                        "name": dimension.get("name"),
-                        "title": dimension.get("shortTitle") or dimension.get("title"),
-                        "description": dimension.get("description"),
-                    }
-                    for dimension in cube.get("dimensions", [])
-                ],
-                "measures": [
-                    {
-                        "name": measure.get("name"),
-                        "title": measure.get("shortTitle") or measure.get("title"),
-                        "description": measure.get("description"),
-                    }
-                    for measure in cube.get("measures", [])
-                ],
-            }
-            for cube in meta.get("cubes", [])
-        ]
-        return "Here is a description of the data available via the read_data tool:\n\n" + yaml.dump(
-            description, indent=2, sort_keys=True
+        """Lightweight catalog of cubes and views available in Cube."""
+        cubes = client.cubes()
+        if not cubes:
+            return "Error: catalog unavailable (no cubes returned by /meta)."
+        return (
+            "Catalog of cubes and views. Use search_cubes() to find one, "
+            "describe_cube(name) for full detail, then read_data() to query.\n\n"
+            + data_to_yaml(_catalog(cubes))
         )
+
+    # -- discovery tools ------------------------------------------------------
+    @mcp.tool("list_cubes")
+    def list_cubes() -> str:
+        """List every cube and view (name, type, title, description, member counts). Views, when any
+        exist, are listed first (a curated view is usually the best entry point; this model may have none).
+        Lightweight on purpose — call describe_cube(name) for the members of one cube/view."""
+        cubes = client.cubes()
+        if not cubes:
+            return "Error: no cubes returned by /meta."
+        return data_to_yaml(_catalog(cubes))
 
     @mcp.tool("describe_data")
     def describe_data() -> str:
-        """Describe the data available in Cube."""
-        return {"type": "text", "text": data_description()}
+        """Catalog of cubes and views (alias of list_cubes, kept for backward compatibility)."""
+        return list_cubes()
 
+    @mcp.tool("describe_cube")
+    def describe_cube(name: str) -> str:
+        """Full detail of a single cube or view: measures (with aggregation type & format), dimensions
+        (with data type), plus title/description, user meta (e.g. ai_context), folders, and — for raw
+        cubes — the connectedComponent joinability hint. This is what you need to write a read_data query."""
+        cubes = client.cubes()
+        match = next((c for c in cubes if c.get("name") == name), None)
+        if match is None:
+            names = [n for n in (c.get("name") for c in cubes) if isinstance(n, str)]
+            close = difflib.get_close_matches(name, names, n=5, cutoff=0.4)
+            hint = f" Did you mean: {', '.join(close)}?" if close else " Use list_cubes() or search_cubes() to find it."
+            return f"Error: no cube or view named '{name}'.{hint}"
+        return data_to_yaml(_describe_one(match))
+
+    @mcp.tool("search_cubes")
+    def search_cubes(query: str, top_k: int = 8) -> str:
+        """Find the most relevant cubes/views for a natural-language query.
+        Ranks by matches on names/titles/descriptions and member names; curated views are boosted.
+        Returns candidates with a score and what matched — then call describe_cube() on the best one."""
+        cubes = client.cubes()
+        if not cubes:
+            return "Error: no cubes returned by /meta."
+        results = _search(cubes, query, top_k)
+        if not results:
+            return f"No cube/view matched '{query}'. Try other terms or call list_cubes() to browse."
+        return data_to_yaml(results)
+
+    @mcp.tool("get_dimension_values")
+    def get_dimension_values(dimension: str, search: Optional[str] = None, limit: int = 50) -> str:
+        """List the distinct values of a dimension (e.g. the statuses of 'user.status') so you can filter on
+        real values without an exploratory query. Ordered by frequency when the owning cube has a count measure.
+        'search' narrows values with a 'contains' filter."""
+        limit = max(1, min(limit, 1000))
+        cube_name = dimension.split(".")[0]
+        entry = next((c for c in client.cubes() if c.get("name") == cube_name), None)
+        count_measure = None
+        if entry is not None:
+            count_measure = next(
+                (m.get("name") for m in entry.get("measures", []) if m.get("aggType") == "count"), None
+            )
+        # Fetch one extra row to know whether the values were truncated.
+        q: dict[str, Any] = {"dimensions": [dimension], "limit": limit + 1}
+        if count_measure:
+            q["measures"] = [count_measure]
+            q["order"] = {count_measure: "desc"}
+        if search:
+            q["filters"] = [{"member": dimension, "operator": "contains", "values": [search]}]
+        response = client.query(q)
+        if error := response.get("error"):
+            return f"Error: {error}"
+        rows = response.get("data", [])
+        truncated = len(rows) > limit
+        rows = rows[:limit]
+        if count_measure:
+            values = [{"value": r.get(dimension), "count": r.get(count_measure)} for r in rows]
+        else:
+            values = [r.get(dimension) for r in rows]
+        out = {
+            "dimension": dimension,
+            "ordered_by": count_measure or "value",
+            "returned": len(values),
+            "truncated": truncated,
+            "values": values,
+        }
+        return data_to_yaml(out)
+
+    # -- query tool -----------------------------------------------------------
     @mcp.tool("read_data")
     def read_data(query: Query) -> str:
-        """Read data from Cube."""
+        """Run a Cube query. Supports server-side `filters`. Small results return inline (YAML); large
+        results (or `output.to_file`) are written to a CSV/JSON file with a compact summary (path, typed
+        columns, aggregates, sample). To export everything, set a high `limit` or `limit: null` — rows
+        beyond Cube's per-query cap are paginated transparently into ONE file (no manual merging).
+        CROSS-CUBE: you may mix members from different cubes in one query (e.g. a measure from one cube
+        grouped by a dimension of another) — Cube resolves the join automatically when they're related.
+        Set `dry_run` to validate the join path / see the compiled SQL without executing. For a time
+        dimension used only to filter a period, set its dateRange and omit `granularity`."""
         try:
-            query_dict = query.model_dump(by_alias=True, exclude_none=True)
-            logger.info("read_data called with query: %s", json.dumps(query_dict))
-            response = client.query(query_dict)
-            if error := response.get("error"):
-                logger.error("Error in read_data: %s\n\n%s", error, response.get("stack"))
-                logger.error("Full response: %s", json.dumps(response))
-                return f"Error: {error}"
-            data = response.get("data", [])
-            logger.info("read_data returned %s rows", len(data))
+            cube_query = query.cube_query()
 
-            data_id = str(uuid.uuid4())
+            # dry-run: compile to SQL, list members/cubes used, do not execute
+            if query.dry_run:
+                logger.info("read_data dry_run: %s", json.dumps(cube_query))
+                resp = client.sql(cube_query)
+                if error := resp.get("error"):
+                    return f"Error (dry_run): {error}"
+                sql_block = resp.get("sql", {}) or {}
+                sql_pair = sql_block.get("sql") or [None, None]
+                members = sorted(set((sql_block.get("aliasNameToMember") or {}).values()))
+                return data_to_yaml(
+                    {
+                        "type": "dry_run",
+                        "sql": sql_pair[0] if isinstance(sql_pair, list) else sql_pair,
+                        "params": sql_pair[1] if isinstance(sql_pair, list) and len(sql_pair) > 1 else None,
+                        "members_used": members,
+                        "note": "No data fetched. If this compiled, the join path is valid.",
+                    }
+                )
 
-            @mcp.resource(f"data://{data_id}")
-            def data_resource() -> str:
-                return json.dumps(data)
+            # Large-export intent (limit None or above one page) → page through Cube's row cap
+            # transparently into a single result, so the agent never has to merge files by hand.
+            paginate = query.limit is None or query.limit > page_size
+            logger.info("read_data query=%s paginate=%s", json.dumps(cube_query), paginate)
+            partial_error = None
+            if paginate:
+                result = client.query_paginated(cube_query, page_size, max_export_rows)
+                if result.get("error") and not result.get("data"):
+                    return f"Error: {_explain_error(result['error'])}"
+                data = result.get("data", [])
+                annotation = result.get("annotation", {})
+                truncated = bool(result.get("truncated"))
+                partial_error = result.get("error")
+            else:
+                response = client.query(cube_query)
+                if error := response.get("error"):
+                    logger.error("Error in read_data: %s\n\n%s", error, response.get("stack"))
+                    return f"Error: {_explain_error(error)}"
+                data = response.get("data", [])
+                annotation = response.get("annotation", {})
+                truncated = query.limit is not None and len(data) >= query.limit
 
-            logger.info("Added results as resource with ID: %s", data_id)
+            logger.info("read_data returned %s rows (truncated=%s)", len(data), truncated)
+            agg_map = client.measure_agg()
+            col_order = _column_order(annotation, data, query.dimensions + query.measures)
+            columns = _columns(annotation, col_order, agg_map)
 
-            output = {
-                "type": "data",
-                "data_id": data_id,
-                "data": data,
-            }
-            yaml_output = data_to_yaml(output)
-            json_output = json.dumps(output)
-            return [
-                TextContent(type="text", text=yaml_output),
-                EmbeddedResource(
-                    type="resource",
-                    resource=TextResourceContents(uri=f"data://{data_id}", text=json_output, mimeType="application/json"),
-                ),
-            ]
+            # Decide inline vs file WITHOUT serializing the whole result up front.
+            want_file = bool(query.output and query.output.to_file)
+            too_big = want_file or len(data) > auto_file_rows
+            inline_text = None
+            if not too_big and data:
+                inline_text = data_to_yaml(_clean({"type": "data", "rows": len(data),
+                                                   "truncated": truncated or None, "data": data}))
+                too_big = len(inline_text) > max_inline_chars
+
+            # ---- file mode: write full result, return only a summary --------
+            if too_big:
+                fmt = query.output.format if query.output else "csv"
+                try:
+                    path = _write_result_file(data, col_order, output_dir, fmt)
+                except OSError as e:
+                    return f"Error: could not write result file in '{output_dir}': {e}"
+                reason = "output.to_file was set." if want_file else f"it exceeds the inline threshold ({auto_file_rows} rows / {max_inline_chars} chars)."
+                note = (
+                    f"Full result ({len(data)} rows) written to file because {reason} "
+                    "Read the file at `path` (already on the local filesystem)."
+                )
+                if truncated:
+                    note += f" NOTE: truncated at {len(data)} rows (export ceiling {max_export_rows})."
+                if partial_error:
+                    note += f" WARNING: a page failed ({partial_error}); data may be incomplete."
+                summary = {
+                    "type": "data_file",
+                    "path": path,
+                    "format": fmt,
+                    "rows": len(data),
+                    "truncated": truncated or None,
+                    "columns": columns,
+                    "aggregates": _aggregates(data, annotation, agg_map) or None,
+                    "sample": data[:sample_rows],
+                    "note": note,
+                }
+                return data_to_yaml(_clean(summary))
+
+            # ---- inline mode (small results) --------------------------------
+            if inline_text is None:  # empty result set
+                inline_text = data_to_yaml(_clean({"type": "data", "rows": len(data),
+                                                   "truncated": truncated or None, "data": data}))
+            return inline_text
 
         except Exception as e:
             logger.error("Error in read_data: %s", str(e))
