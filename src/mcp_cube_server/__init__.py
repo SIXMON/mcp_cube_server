@@ -7,6 +7,11 @@ import os
 import dotenv
 
 from . import server
+from .auth import ConvoicarAuth, DEFAULT_CLIENT_ID, DEFAULT_PORT
+
+
+def _truthy(value):
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
 
 
 def args_to_kwargs(unknown):
@@ -59,18 +64,23 @@ def main():
 
     dotenv.load_dotenv()
 
+    # Auth mode: authenticate users via Convoicar (OAuth) and get the Cube endpoint + JWT
+    # per-user from the server. The Cube signing secret is NOT needed on this machine.
+    auth_enabled = _truthy(os.getenv("CONVOICAR_AUTH", ""))
+
     required = {
         "endpoint": os.getenv("CUBE_ENDPOINT"),
         "api_secret": os.getenv("CUBE_API_SECRET"),
         "token_payload": os.getenv("CUBE_TOKEN_PAYLOAD", "{}"),
     }
 
+    # In auth mode the endpoint/secret come from Convoicar, so they are optional here.
     parser.add_argument(
-        "--endpoint", required=not required["endpoint"], default=required["endpoint"]
+        "--endpoint", required=not auth_enabled and not required["endpoint"], default=required["endpoint"]
     )
     parser.add_argument(
         "--api_secret",
-        required=not required["api_secret"],
+        required=not auth_enabled and not required["api_secret"],
         default=required["api_secret"],
     )
 
@@ -106,9 +116,24 @@ def main():
         # Unknown --flags are injected as JWT claims (Cube security context). Surface which ones.
         logger.info("Extra JWT claims from CLI flags: %s", ", ".join(sorted(additional_kwargs)))
 
+    auth = None
+    if auth_enabled:
+        base_url = os.getenv("CONVOICAR_URL")
+        if not base_url:
+            logger.error("CONVOICAR_AUTH is set but CONVOICAR_URL is missing (e.g. https://web.convoicar.fr)")
+            return
+        auth = ConvoicarAuth(
+            base_url=base_url,
+            client_id=os.getenv("CONVOICAR_OAUTH_CLIENT_ID", DEFAULT_CLIENT_ID),
+            port=int(os.getenv("CONVOICAR_OAUTH_PORT", str(DEFAULT_PORT))),
+            logger=logger,
+        )
+        logger.info("Convoicar auth enabled (%s) — data tools require login.", base_url)
+
     credentials = {
-        "endpoint": args.endpoint,
-        "api_secret": args.api_secret,
+        # In auth mode these are supplied per-user by Convoicar; keep them None locally.
+        "endpoint": None if auth_enabled else args.endpoint,
+        "api_secret": None if auth_enabled else args.api_secret,
         "token_payload": token_payload,
     }
 
@@ -122,6 +147,7 @@ def main():
         credentials,
         logger,
         config,
+        auth=auth,
     )
 
 

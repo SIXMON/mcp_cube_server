@@ -6,6 +6,7 @@ from pydantic import BaseModel, Field
 import requests
 import json
 import logging
+import functools
 import yaml
 import uuid
 import time
@@ -78,18 +79,24 @@ class CubeClient:
     token_ttl = 3600  # seconds — generated tokens carry iat/exp
     meta_ttl = 60  # seconds — /meta is cached to avoid a round-trip on every tool call
 
-    def __init__(self, endpoint: str, api_secret: str, token_payload: dict, logger: logging.Logger):
-        self.endpoint = endpoint
+    def __init__(self, endpoint: Optional[str], api_secret: Optional[str], token_payload: dict,
+                 logger: logging.Logger, auth=None):
+        # In auth mode (`auth` set) the Cube endpoint and JWT come from Convoicar per-user,
+        # so this client never holds the Cube signing secret. In dev/standalone mode it signs
+        # locally with `api_secret`, as before.
+        self.auth = auth
+        self._static_endpoint = endpoint
         self.api_secret = api_secret
         self.token_payload = token_payload or {}
         self.token = None
         self.logger = logger
         self._meta_cache: Optional[dict] = None
         self._meta_at = 0.0
-        self._refresh_token()
-        meta = self._fetch_meta()
-        if meta.get("error"):
-            logger.warning("Cube /meta unavailable at startup: %s", meta.get("error"))
+        if self.auth is None:
+            self._refresh_token()
+            meta = self._fetch_meta()
+            if meta.get("error"):
+                logger.warning("Cube /meta unavailable at startup: %s", meta.get("error"))
 
     # -- auth ----------------------------------------------------------------
     def _generate_token(self):
@@ -101,7 +108,16 @@ class CubeClient:
         return jwt.encode(payload, self.api_secret, algorithm="HS256")
 
     def _refresh_token(self):
-        self.token = self._generate_token()
+        if self.auth is not None:
+            self.auth.invalidate_cube()  # force a fresh Cube token from Convoicar on next call
+        else:
+            self.token = self._generate_token()
+
+    def _endpoint(self) -> str:
+        return self.auth.cube_endpoint() if self.auth is not None else (self._static_endpoint or "")
+
+    def _auth_value(self) -> str:
+        return self.auth.cube_token() if self.auth is not None else (self.token or "")
 
     # -- http ----------------------------------------------------------------
     @staticmethod
@@ -114,8 +130,8 @@ class CubeClient:
 
     def _request(self, route: "CubeClient.Route", **params) -> dict:
         request_time = time.time()
-        headers = {"Authorization": self.token or ""}
-        url = f"{self.endpoint.rstrip('/')}/{route}"
+        headers = {"Authorization": self._auth_value()}
+        url = f"{self._endpoint().rstrip('/')}/{route}"
         serialized_params = {k: json.dumps(v) for k, v in params.items()}
 
         try:
@@ -132,13 +148,14 @@ class CubeClient:
                 response = requests.get(url, headers=headers, params=serialized_params, timeout=self.request_timeout)
                 payload = self._parse(response)
 
-            # 403 is usually an auth problem (wrong api_secret / missing security-context claim),
-            # not an expiry. Regenerate the token (picks up a fresh exp) and retry once; if it still
-            # fails the caller sees the error.
-            if response.status_code == 403:
-                self.logger.warning("403 from Cube — regenerating token and retrying once (check api_secret / token_payload claims)")
+            # 401/403 is usually an auth problem (expired/missing token or missing security-context
+            # claim), not an expiry of the query. Refresh the token (in auth mode this re-fetches a
+            # fresh Cube JWT from Convoicar) and retry once; if it still fails the caller sees the error.
+            if response.status_code in (401, 403):
+                self.logger.warning("%s from Cube — refreshing token and retrying once", response.status_code)
                 self._refresh_token()
-                headers = {"Authorization": self.token or ""}
+                headers = {"Authorization": self._auth_value()}
+                url = f"{self._endpoint().rstrip('/')}/{route}"
                 response = requests.get(url, headers=headers, params=serialized_params, timeout=self.request_timeout)
                 payload = self._parse(response)
 
@@ -633,7 +650,7 @@ def _explain_error(error) -> str:
     return e
 
 
-def main(credentials, logger, config=None):
+def main(credentials, logger, config=None, auth=None):
     config = config or {}
     output_dir = config.get("output_dir") or os.path.join(tempfile.gettempdir(), "mcp_cube_exports")
     auto_file_rows = int(config.get("auto_file_rows", 1000))
@@ -642,11 +659,44 @@ def main(credentials, logger, config=None):
     page_size = int(config.get("page_size", 50_000))  # stays under Cube's per-query row cap
     max_export_rows = int(config.get("max_export_rows", 1_000_000))  # safety ceiling for a single export
 
-    mcp = FastMCP("Cube.dev")
-    client = CubeClient(**credentials, logger=logger)
+    mcp = FastMCP("Convoicar Cube")
+    client = CubeClient(**credentials, logger=logger, auth=auth)
+
+    # Gate: when authentication is enabled, no data tool runs until the user has logged in
+    # to Convoicar. Applied as the inner decorator so the tool FastMCP registers is the gated one.
+    def require_auth(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            if auth is not None and not auth.is_authenticated():
+                return auth.auth_error()
+            return fn(*args, **kwargs)
+        return wrapper
+
+    # -- authentication tools -------------------------------------------------
+    @mcp.tool("login")
+    def login() -> str:
+        """Log in to Convoicar via your browser (SSO). Required before any data tool will run.
+        Opens the Convoicar login page; on success the Cube tools are unlocked for your account."""
+        if auth is None:
+            return "Authentication is disabled on this server (local/dev mode) — data tools are open."
+        try:
+            user = auth.login()
+        except Exception as e:  # noqa: BLE001 — surface the reason to the user
+            return f"Login failed: {e}"
+        who = user.get("email") or user.get("name") or f"user #{user.get('id')}"
+        return f"Logged in as {who}. Cube data tools are now unlocked."
+
+    @mcp.tool("logout")
+    def logout() -> str:
+        """Log out of Convoicar and lock all data tools until the next login."""
+        if auth is None:
+            return "Authentication is disabled on this server (local/dev mode)."
+        auth.logout()
+        return "Logged out. Data tools are locked until you log in again."
 
     # -- catalog resource (lightweight; replaces the old monolithic dump) -----
     @mcp.resource("context://data_description")
+    @require_auth
     def data_description() -> str:
         """Lightweight catalog of cubes and views available in Cube."""
         cubes = client.cubes()
@@ -660,6 +710,7 @@ def main(credentials, logger, config=None):
 
     # -- discovery tools ------------------------------------------------------
     @mcp.tool("list_cubes")
+    @require_auth
     def list_cubes() -> str:
         """List every cube and view (name, type, title, description, member counts). Views, when any
         exist, are listed first (a curated view is usually the best entry point; this model may have none).
@@ -670,11 +721,13 @@ def main(credentials, logger, config=None):
         return data_to_yaml(_catalog(cubes))
 
     @mcp.tool("describe_data")
+    @require_auth
     def describe_data() -> str:
         """Catalog of cubes and views (alias of list_cubes, kept for backward compatibility)."""
         return list_cubes()
 
     @mcp.tool("describe_cube")
+    @require_auth
     def describe_cube(name: str) -> str:
         """Full detail of a single cube or view: measures (with aggregation type & format), dimensions
         (with data type), plus title/description, user meta (e.g. ai_context), folders, and — for raw
@@ -689,6 +742,7 @@ def main(credentials, logger, config=None):
         return data_to_yaml(_describe_one(match))
 
     @mcp.tool("search_cubes")
+    @require_auth
     def search_cubes(query: str, top_k: int = 8) -> str:
         """Find the most relevant cubes/views for a natural-language query.
         Ranks by matches on names/titles/descriptions and member names; curated views are boosted.
@@ -702,6 +756,7 @@ def main(credentials, logger, config=None):
         return data_to_yaml(results)
 
     @mcp.tool("get_dimension_values")
+    @require_auth
     def get_dimension_values(dimension: str, search: Optional[str] = None, limit: int = 50) -> str:
         """List the distinct values of a dimension (e.g. the statuses of 'user.status') so you can filter on
         real values without an exploratory query. Ordered by frequency when the owning cube has a count measure.
@@ -742,6 +797,7 @@ def main(credentials, logger, config=None):
 
     # -- query tool -----------------------------------------------------------
     @mcp.tool("read_data")
+    @require_auth
     def read_data(query: Query) -> str:
         """Run a Cube query. Supports server-side `filters`. Small results return inline (YAML); large
         results (or `output.to_file`) are written to a CSV/JSON file with a compact summary (path, typed

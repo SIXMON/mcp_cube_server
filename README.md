@@ -42,7 +42,69 @@ Run a Cube query. The `Query` accepts:
   `output.to_file: true` to force this for any size. The file lives on the local filesystem (the MCP runs locally),
   so the client can read it directly.
 
-## Configuration
+## Authentication (Convoicar)
+
+When `CONVOICAR_AUTH=1`, the server is **locked**: every data tool returns an auth error until the
+user logs in to Convoicar. Login is a real browser SSO (OAuth 2.1, Authorization Code + PKCE) on
+Convoicar's own login page — the MCP never sees the password.
+
+- **Log in**: run the `login` tool from Claude, or the `mcp-cube-login` command in a terminal. A browser
+  opens; after login a branded confirmation page appears (it closes itself after 5 s) and the tools unlock.
+- **Log out**: the `logout` tool, or `mcp-cube-login --logout`.
+- After login, the MCP exchanges its token for a short-lived, **server-signed Cube JWT** via
+  `GET /api/v2/mcp/session` on Convoicar. That JWT carries the user's security context
+  (`user_id, email, super_admin, roles, account_ids`). **The Cube signing secret stays on the Convoicar
+  server** and is never present on the user's machine.
+- Tokens are cached at `~/.config/convoicar-mcp/credentials.json` (mode `0600`) and refreshed automatically.
+
+Auth-mode configuration (env):
+
+- `CONVOICAR_AUTH=1` — enable authentication (locks the tools).
+- `CONVOICAR_URL` — base URL of Convoicar (e.g. `https://web.convoicar.fr`).
+- `CONVOICAR_OAUTH_CLIENT_ID` — default `mcp-cube-public-client`.
+- `CONVOICAR_OAUTH_PORT` — loopback port for the login callback (default `47823`).
+
+> Server-side prerequisite: Convoicar must expose the OAuth provider and set `CUBE_API_SECRET` +
+> `CUBE_ENDPOINT` in its environment, and the public client must be provisioned once per environment
+> with `rails convoicar:oauth:setup_mcp_client`.
+
+## Install in Claude Desktop (edit `claude_desktop_config.json`)
+
+Add the server by hand to Claude Desktop's config file, then restart Claude Desktop.
+
+Open **Settings → Developer → Edit Config** (or edit the file directly):
+
+- macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`
+- Windows: `%APPDATA%\Claude\claude_desktop_config.json`
+
+Add a `convoicar-cube` entry under `mcpServers` (create the file / key if absent):
+
+```json
+{
+  "mcpServers": {
+    "convoicar-cube": {
+      "command": "uvx",
+      "args": ["--from", "/absolute/path/to/mcp_cube_server", "mcp_cube_server"],
+      "env": {
+        "CONVOICAR_AUTH": "1",
+        "CONVOICAR_URL": "https://web.convoicar.fr"
+      }
+    }
+  }
+}
+```
+
+Then restart Claude Desktop and run the `login` tool (a browser opens; a branded Convoicar page
+confirms and auto-closes).
+
+> Prerequisites on the user's machine: **`uv` on `PATH`** (provides `uvx`) and **Python 3.11+**.
+> On Windows, `uvx` is typically at `C:\Users\<you>\.local\bin\uvx.exe`; give the full path if it is
+> not on `PATH`. To pin a published revision instead of a local checkout, use
+> `"--from", "git+https://github.com/<org>/mcp_cube_server@<sha>"`.
+
+## Configuration (standalone / dev, no auth)
+
+Without `CONVOICAR_AUTH`, the server signs the Cube JWT itself (legacy/dev mode).
 
 Credentials (env or CLI flag):
 
