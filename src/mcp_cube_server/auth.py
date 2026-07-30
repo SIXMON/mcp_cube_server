@@ -30,6 +30,8 @@ import requests
 
 DEFAULT_CLIENT_ID = "mcp-cube-public-client"
 DEFAULT_PORT = 47823
+# Production Convoicar. Baked in so end users need no env var at all; override with CONVOICAR_URL.
+DEFAULT_BASE_URL = "https://web.convoicar.fr"
 DEFAULT_SCOPE = "cube"
 CONFIG_DIR = Path(os.path.expanduser("~/.config/convoicar-mcp"))
 CREDENTIALS_PATH = CONFIG_DIR / "credentials.json"
@@ -470,11 +472,8 @@ def _error_page(result: dict) -> str:
 # `mcp-cube-login` console command
 # ---------------------------------------------------------------------------
 def _auth_from_env() -> ConvoicarAuth:
-    base_url = os.getenv("CONVOICAR_URL")
-    if not base_url:
-        raise SystemExit("CONVOICAR_URL is not set (e.g. https://web.convoicar.fr).")
     return ConvoicarAuth(
-        base_url=base_url,
+        base_url=os.getenv("CONVOICAR_URL") or DEFAULT_BASE_URL,
         client_id=os.getenv("CONVOICAR_OAUTH_CLIENT_ID", DEFAULT_CLIENT_ID),
         port=int(os.getenv("CONVOICAR_OAUTH_PORT", str(DEFAULT_PORT))),
     )

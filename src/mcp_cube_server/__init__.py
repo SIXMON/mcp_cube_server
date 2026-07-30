@@ -7,7 +7,7 @@ import os
 import dotenv
 
 from . import server
-from .auth import ConvoicarAuth, DEFAULT_CLIENT_ID, DEFAULT_PORT
+from .auth import ConvoicarAuth, DEFAULT_BASE_URL, DEFAULT_CLIENT_ID, DEFAULT_PORT
 
 
 def _truthy(value):
@@ -64,28 +64,29 @@ def main():
 
     dotenv.load_dotenv()
 
-    # Auth mode: authenticate users via Convoicar (OAuth) and get the Cube endpoint + JWT
-    # per-user from the server. The Cube signing secret is NOT needed on this machine.
-    auth_enabled = _truthy(os.getenv("CONVOICAR_AUTH", ""))
-
-    required = {
-        "endpoint": os.getenv("CUBE_ENDPOINT"),
-        "api_secret": os.getenv("CUBE_API_SECRET"),
-        "token_payload": os.getenv("CUBE_TOKEN_PAYLOAD", "{}"),
-    }
-
-    # In auth mode the endpoint/secret come from Convoicar, so they are optional here.
-    parser.add_argument(
-        "--endpoint", required=not auth_enabled and not required["endpoint"], default=required["endpoint"]
-    )
-    parser.add_argument(
-        "--api_secret",
-        required=not auth_enabled and not required["api_secret"],
-        default=required["api_secret"],
-    )
+    # Never required up front: in auth mode Convoicar supplies both per-user, and we only know
+    # which mode we are in once the flags are parsed (see auth_enabled below).
+    parser.add_argument("--endpoint", required=False, default=os.getenv("CUBE_ENDPOINT"))
+    parser.add_argument("--api_secret", required=False, default=os.getenv("CUBE_API_SECRET"))
 
     args, unknown = parser.parse_known_args()
     additional_kwargs = args_to_kwargs(unknown)
+
+    # Auth mode: authenticate users via Convoicar (OAuth) and get the Cube endpoint + JWT
+    # per-user from the server. The Cube signing secret is NOT needed on this machine.
+    # This is the DEFAULT so end users need no configuration at all; an explicit
+    # CONVOICAR_AUTH wins, and local Cube credentials still opt into standalone mode.
+    convoicar_auth = os.getenv("CONVOICAR_AUTH", "").strip()
+    if convoicar_auth:
+        auth_enabled = _truthy(convoicar_auth)
+    else:
+        auth_enabled = not (args.endpoint and args.api_secret)
+
+    if not auth_enabled and not (args.endpoint and args.api_secret):
+        parser.error(
+            "standalone mode (CONVOICAR_AUTH=0) needs --endpoint/CUBE_ENDPOINT and "
+            "--api_secret/CUBE_API_SECRET"
+        )
 
     logger = logging.getLogger(__name__)
     logger.propagate = False
@@ -105,7 +106,7 @@ def main():
         logger.addHandler(file_handler)
 
     try:
-        token_payload = json.loads(required["token_payload"])
+        token_payload = json.loads(os.getenv("CUBE_TOKEN_PAYLOAD", "{}"))
         for key, value in additional_kwargs.items():
             token_payload[key] = value
     except json.JSONDecodeError:
@@ -118,10 +119,7 @@ def main():
 
     auth = None
     if auth_enabled:
-        base_url = os.getenv("CONVOICAR_URL")
-        if not base_url:
-            logger.error("CONVOICAR_AUTH is set but CONVOICAR_URL is missing (e.g. https://web.convoicar.fr)")
-            return
+        base_url = os.getenv("CONVOICAR_URL") or DEFAULT_BASE_URL
         auth = ConvoicarAuth(
             base_url=base_url,
             client_id=os.getenv("CONVOICAR_OAUTH_CLIENT_ID", DEFAULT_CLIENT_ID),

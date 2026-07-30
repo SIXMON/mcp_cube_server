@@ -398,7 +398,7 @@ wheels = [
 
 [[package]]
 name = "mcp-cube-server"
-version = "0.1.0"
+version = "0.1.2"
 source = { editable = "." }
 dependencies = [
     { name = "mcp" },
@@ -415,7 +415,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "mcp", specifier = ">=1.2.1" },
+    { name = "mcp", specifier = ">=1.2.1,<2" },
     { name = "pyjwt", specifier = ">=2.10.1" },
     { name = "python-dotenv" },
     { name = "pyyaml", specifier = ">=6.0.2" },
