@@ -42,33 +42,42 @@ Run a Cube query. The `Query` accepts:
   `output.to_file: true` to force this for any size. The file lives on the local filesystem (the MCP runs locally),
   so the client can read it directly.
 
-## Authentication (Convoicar)
+## Authentication
 
-Convoicar auth is the **default mode** — with no configuration at all, the server talks to
-`https://web.convoicar.fr`. In this mode the server is **locked**: every data tool returns an auth
-error until the user logs in to Convoicar. Login is a real browser SSO (OAuth 2.1, Authorization Code + PKCE) on
-Convoicar's own login page — the MCP never sees the password.
+Auth mode is the **default** — with no configuration at all, the server talks to the built-in auth
+server. In this mode the server is **locked**: every data tool returns an auth error until the user
+logs in. Login is a real browser SSO (OAuth 2.1, Authorization Code + PKCE) on the auth server's own
+login page — the MCP never sees the password.
 
-- **Log in**: run the `login` tool from Claude, or the `mcp-cube-login` command in a terminal. A browser
-  opens; after login a branded confirmation page appears (it closes itself after 5 s) and the tools unlock.
+- **Log in**: run the `login` tool from Claude, or the `mcp-cube-login` command in a terminal. The tool
+  returns the login link and opens it in your browser when it can; after login a confirmation page
+  appears (it closes itself after 5 s) and the tools unlock — no need to call anything again.
+- **Check a login**: the `login_status` tool (logged in / still waiting for the browser / failed).
 - **Log out**: the `logout` tool, or `mcp-cube-login --logout`.
 - After login, the MCP exchanges its token for a short-lived, **server-signed Cube JWT** via
-  `GET /api/v2/mcp/session` on Convoicar. That JWT carries the user's security context
-  (`user_id, email, super_admin, roles, account_ids`). **The Cube signing secret stays on the Convoicar
+  `GET /api/v2/mcp/session` on the auth server. That JWT carries the user's security context
+  (identity and tenancy claims, defined server-side). **The Cube signing secret stays on the auth
   server** and is never present on the user's machine.
-- Tokens are cached at `~/.config/convoicar-mcp/credentials.json` (mode `0600`) and refreshed automatically.
+- Tokens are cached at `~/.config/mcp-cube/credentials.json` (mode `0600`) and refreshed automatically.
+
+> Why the link is always shown: MCP clients start the server with a stripped environment. On Linux,
+> Python's `webbrowser` only registers a GUI browser when `DISPLAY`/`WAYLAND_DISPLAY` is set, so under
+> Claude Desktop it finds none. The server works around it (it retries `xdg-open`/`gio`/`$BROWSER` with a
+> restored `DISPLAY`, and uses `open` on macOS), but it never depends on that succeeding — the `login` tool
+> returns immediately with a clickable URL and completes the round-trip in the background. That also makes
+> the flow usable when the server runs in a container or on another machine.
 
 Auth-mode configuration (env) — **all optional**:
 
-- `CONVOICAR_AUTH` — `1`/`0` to force auth mode on or off. Unset (default): auth mode, unless local
+- `MCP_CUBE_AUTH` — `1`/`0` to force auth mode on or off. Unset (default): auth mode, unless local
   Cube credentials are supplied (see [standalone](#configuration-standalone--dev-no-auth)).
-- `CONVOICAR_URL` — base URL of Convoicar. Default `https://web.convoicar.fr`; override for staging/dev.
-- `CONVOICAR_OAUTH_CLIENT_ID` — default `mcp-cube-public-client`.
-- `CONVOICAR_OAUTH_PORT` — loopback port for the login callback (default `47823`).
+- `MCP_CUBE_URL` — base URL of the auth server; override for staging/dev.
+- `MCP_CUBE_OAUTH_CLIENT_ID` — default `mcp-cube-public-client`.
+- `MCP_CUBE_OAUTH_PORT` — loopback port for the login callback (default `47823`).
 
-> Server-side prerequisite: Convoicar must expose the OAuth provider and set `CUBE_API_SECRET` +
-> `CUBE_ENDPOINT` in its environment, and the public client must be provisioned once per environment
-> with `rails convoicar:oauth:setup_mcp_client`.
+> Server-side prerequisite: the auth server must expose the OAuth provider (`/oauth/authorize`,
+> `/oauth/token`, `/oauth/revoke`) plus `GET /api/v2/mcp/session`, hold `CUBE_API_SECRET` and
+> `CUBE_ENDPOINT` in its own environment, and have the public client provisioned once per environment.
 
 ## Install in Claude Desktop (edit `claude_desktop_config.json`)
 
@@ -79,13 +88,13 @@ Open **Settings → Developer → Edit Config** (or edit the file directly):
 - macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`
 - Windows: `%APPDATA%\Claude\claude_desktop_config.json`
 
-Add a `convoicar-cube` entry under `mcpServers` (create the file / key if absent). No `env` block is
-needed — auth mode and `https://web.convoicar.fr` are the defaults:
+Add an `mcp-cube` entry under `mcpServers` (create the file / key if absent). No `env` block is
+needed — auth mode and the built-in auth server are the defaults:
 
 ```json
 {
   "mcpServers": {
-    "convoicar-cube": {
+    "mcp-cube": {
       "command": "uvx",
       "args": ["--from", "/absolute/path/to/mcp_cube_server", "mcp_cube_server"]
     }
@@ -93,10 +102,10 @@ needed — auth mode and `https://web.convoicar.fr` are the defaults:
 }
 ```
 
-To point at another environment, add `"env": { "CONVOICAR_URL": "https://staging.convoicar.fr" }`.
+To point at another environment, add `"env": { "MCP_CUBE_URL": "https://staging.example.com" }`.
 
-Then restart Claude Desktop and run the `login` tool (a browser opens; a branded Convoicar page
-confirms and auto-closes).
+Then restart Claude Desktop and run the `login` tool (a browser opens, or you click the link it
+returns; a confirmation page appears and auto-closes).
 
 > Prerequisites on the user's machine: **`uv` on `PATH`** (provides `uvx`) and **Python 3.11+**.
 > On Windows, `uvx` is typically at `C:\Users\<you>\.local\bin\uvx.exe`; give the full path if it is
@@ -106,8 +115,8 @@ confirms and auto-closes).
 ## Configuration (standalone / dev, no auth)
 
 Supplying **both** Cube credentials below (via env or CLI flag) switches the server to standalone
-mode: it signs the Cube JWT itself and never contacts Convoicar. `CONVOICAR_AUTH=1` overrides this
-and keeps auth mode; `CONVOICAR_AUTH=0` requires the two credentials and errors out without them.
+mode: it signs the Cube JWT itself and never contacts the auth server. `MCP_CUBE_AUTH=1` overrides
+this and keeps auth mode; `MCP_CUBE_AUTH=0` requires the two credentials and errors out without them.
 
 Credentials (env or CLI flag):
 

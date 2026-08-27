@@ -7,7 +7,7 @@ import os
 import dotenv
 
 from . import server
-from .auth import ConvoicarAuth, DEFAULT_BASE_URL, DEFAULT_CLIENT_ID, DEFAULT_PORT
+from .auth import CubeAuth, DEFAULT_BASE_URL, DEFAULT_CLIENT_ID, DEFAULT_PORT
 
 
 def _truthy(value):
@@ -64,7 +64,7 @@ def main():
 
     dotenv.load_dotenv()
 
-    # Never required up front: in auth mode Convoicar supplies both per-user, and we only know
+    # Never required up front: in auth mode the auth server supplies both per-user, and we only know
     # which mode we are in once the flags are parsed (see auth_enabled below).
     parser.add_argument("--endpoint", required=False, default=os.getenv("CUBE_ENDPOINT"))
     parser.add_argument("--api_secret", required=False, default=os.getenv("CUBE_API_SECRET"))
@@ -72,19 +72,19 @@ def main():
     args, unknown = parser.parse_known_args()
     additional_kwargs = args_to_kwargs(unknown)
 
-    # Auth mode: authenticate users via Convoicar (OAuth) and get the Cube endpoint + JWT
-    # per-user from the server. The Cube signing secret is NOT needed on this machine.
+    # Auth mode: authenticate users against the auth server (OAuth) and get the Cube endpoint
+    # + JWT per-user from it. The Cube signing secret is NOT needed on this machine.
     # This is the DEFAULT so end users need no configuration at all; an explicit
-    # CONVOICAR_AUTH wins, and local Cube credentials still opt into standalone mode.
-    convoicar_auth = os.getenv("CONVOICAR_AUTH", "").strip()
-    if convoicar_auth:
-        auth_enabled = _truthy(convoicar_auth)
+    # MCP_CUBE_AUTH wins, and local Cube credentials still opt into standalone mode.
+    auth_flag = os.getenv("MCP_CUBE_AUTH", "").strip()
+    if auth_flag:
+        auth_enabled = _truthy(auth_flag)
     else:
         auth_enabled = not (args.endpoint and args.api_secret)
 
     if not auth_enabled and not (args.endpoint and args.api_secret):
         parser.error(
-            "standalone mode (CONVOICAR_AUTH=0) needs --endpoint/CUBE_ENDPOINT and "
+            "standalone mode (MCP_CUBE_AUTH=0) needs --endpoint/CUBE_ENDPOINT and "
             "--api_secret/CUBE_API_SECRET"
         )
 
@@ -119,17 +119,17 @@ def main():
 
     auth = None
     if auth_enabled:
-        base_url = os.getenv("CONVOICAR_URL") or DEFAULT_BASE_URL
-        auth = ConvoicarAuth(
+        base_url = os.getenv("MCP_CUBE_URL") or DEFAULT_BASE_URL
+        auth = CubeAuth(
             base_url=base_url,
-            client_id=os.getenv("CONVOICAR_OAUTH_CLIENT_ID", DEFAULT_CLIENT_ID),
-            port=int(os.getenv("CONVOICAR_OAUTH_PORT", str(DEFAULT_PORT))),
+            client_id=os.getenv("MCP_CUBE_OAUTH_CLIENT_ID", DEFAULT_CLIENT_ID),
+            port=int(os.getenv("MCP_CUBE_OAUTH_PORT", str(DEFAULT_PORT))),
             logger=logger,
         )
-        logger.info("Convoicar auth enabled (%s) — data tools require login.", base_url)
+        logger.info("Auth mode enabled (%s) — data tools require login.", base_url)
 
     credentials = {
-        # In auth mode these are supplied per-user by Convoicar; keep them None locally.
+        # In auth mode these are supplied per-user by the auth server; keep them None locally.
         "endpoint": None if auth_enabled else args.endpoint,
         "api_secret": None if auth_enabled else args.api_secret,
         "token_payload": token_payload,

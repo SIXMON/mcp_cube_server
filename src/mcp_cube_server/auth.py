@@ -1,13 +1,13 @@
-"""OAuth 2.1 (Authorization Code + PKCE) client that logs the MCP into Convoicar.
+"""OAuth 2.1 (Authorization Code + PKCE) client that logs the MCP into the auth server.
 
-The user authenticates in their browser on Convoicar's real login page (SSO); the MCP
+The user authenticates in their browser on the auth server's own login page (SSO); the MCP
 never sees the password. After login the MCP exchanges its access token for a short-lived,
 server-signed Cube JWT (carrying the security context) via GET /api/v2/mcp/session — the
 Cube signing secret therefore never lives on the user's machine.
 
 Entry points:
-  * `ConvoicarAuth`      — used by the MCP server (login/logout tools + Cube token access).
-  * `login_cli()`        — the `mcp-cube-login` console command (log in outside a tool call).
+  * `CubeAuth`     — used by the MCP server (login/logout tools + Cube token access).
+  * `login_cli()`  — the `mcp-cube-login` console command (log in outside a tool call).
 """
 
 from __future__ import annotations
@@ -18,7 +18,10 @@ import json
 import logging
 import os
 import secrets
+import shutil
+import subprocess
 import sys
+import threading
 import time
 import urllib.parse
 import webbrowser
@@ -30,10 +33,10 @@ import requests
 
 DEFAULT_CLIENT_ID = "mcp-cube-public-client"
 DEFAULT_PORT = 47823
-# Production Convoicar. Baked in so end users need no env var at all; override with CONVOICAR_URL.
+# Production auth server. Baked in so end users need no env var at all; override with MCP_CUBE_URL.
 DEFAULT_BASE_URL = "https://web.convoicar.fr"
 DEFAULT_SCOPE = "cube"
-CONFIG_DIR = Path(os.path.expanduser("~/.config/convoicar-mcp"))
+CONFIG_DIR = Path(os.path.expanduser("~/.config/mcp-cube"))
 CREDENTIALS_PATH = CONFIG_DIR / "credentials.json"
 _HTTP_TIMEOUT = 30
 _LOGIN_TIMEOUT = 300  # seconds to wait for the browser round-trip
@@ -57,8 +60,130 @@ def _pkce_pair() -> tuple[str, str]:
     return verifier, challenge
 
 
-class ConvoicarAuth:
-    """Holds OAuth tokens for one Convoicar user and vends Cube credentials."""
+# ---------------------------------------------------------------------------
+# Opening the user's browser
+# ---------------------------------------------------------------------------
+def _browser_commands(url: str) -> list[list[str]]:
+    """Desktop openers to try by hand, most specific first."""
+    cmds: list[list[str]] = []
+    for entry in (os.environ.get("BROWSER") or "").split(os.pathsep):
+        entry = entry.strip()
+        if not entry:
+            continue
+        parts = entry.split()
+        cmds.append([part.replace("%s", url) for part in parts] if "%s" in entry else parts + [url])
+    if sys.platform == "darwin":
+        cmds.append(["open", url])
+    else:
+        cmds += [
+            ["xdg-open", url],
+            ["gio", "open", url],
+            ["x-www-browser", url],
+            ["sensible-browser", url],
+            ["firefox", url],
+            ["google-chrome", url],
+            ["chromium", url],
+        ]
+    return cmds
+
+
+def _spawn_browser(cmd: list[str], env: Optional[dict], logger: logging.Logger) -> bool:
+    if shutil.which(cmd[0]) is None:
+        return False
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,  # survive the MCP server, never inherit its stdio
+        )
+    except OSError as e:
+        logger.debug("Browser command %s did not start: %s", cmd[0], e)
+        return False
+    try:
+        # A launcher (xdg-open, gio, open) exits as soon as it hands the URL over; a browser
+        # started directly keeps running. Exit 0 or still alive both mean "it worked".
+        return proc.wait(timeout=2) == 0
+    except subprocess.TimeoutExpired:
+        return True
+
+
+def open_browser(url: str, logger: Optional[logging.Logger] = None, timeout: float = 5.0) -> bool:
+    """Best-effort: open `url` in the user's browser. Returns whether one was launched.
+
+    MCP clients spawn the server with a stripped environment, which breaks the stdlib path on
+    Linux: CPython only registers GUI browsers when DISPLAY or WAYLAND_DISPLAY is set (see
+    webbrowser.register_standard_browsers), so under Claude Desktop `webbrowser.open()` finds no
+    browser at all and silently returns False. macOS is immune — it always registers the
+    `open`-based handler. So we retry with the desktop openers ourselves, putting a plausible
+    DISPLAY back when the client dropped it. Callers must still show the URL: a container or a
+    remote MCP has no browser to open at all.
+
+    Bounded by `timeout`, because opening is not reliably quick: when BROWSER is set the stdlib
+    uses GenericBrowser, which runs the browser in the foreground and waits for it to *exit*.
+    A launch we did not see finish is simply reported as not opened — the URL is shown either way.
+    """
+    log = logger or logging.getLogger(__name__)
+    outcome: dict = {}
+
+    def run() -> None:
+        outcome["ok"] = _open_browser_now(url, log)
+
+    thread = threading.Thread(target=run, name="mcp-cube-open-browser", daemon=True)
+    thread.start()
+    thread.join(timeout)
+    if "ok" not in outcome:
+        log.debug("Browser launch still pending after %.1fs — falling back to showing the URL.", timeout)
+        return False
+    return outcome["ok"]
+
+
+def _open_browser_now(url: str, log: logging.Logger) -> bool:
+    try:
+        if webbrowser.open(url):
+            return True
+    except Exception as e:  # noqa: BLE001 — an opener must never break the login
+        log.debug("webbrowser.open failed: %s", e)
+
+    if os.name == "nt":
+        try:
+            os.startfile(url)  # type: ignore[attr-defined]
+            return True
+        except OSError as e:
+            log.debug("os.startfile failed: %s", e)
+            return False
+
+    env = None
+    if sys.platform != "darwin" and not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+        # Xwayland answers on :0 as well, so this covers X11 and Wayland sessions alike.
+        env = {**os.environ, "DISPLAY": ":0"}
+    return any(_spawn_browser(cmd, env, log) for cmd in _browser_commands(url))
+
+
+class _PendingLogin:
+    """One browser login in flight. The loopback round-trip runs in a background thread so the
+    `login` tool can return the URL immediately instead of blocking the client for 5 minutes."""
+
+    def __init__(self, url: str, state: str, verifier: str, server: HTTPServer):
+        self.url = url
+        self.opened = False  # set once the browser launch has been attempted
+        self.state = state
+        self.verifier = verifier
+        self.server = server
+        self.status = "pending"  # pending | done | failed
+        self.error: Optional[str] = None
+        self.user: dict = {}
+        self.thread: Optional[threading.Thread] = None
+
+    @property
+    def running(self) -> bool:
+        return self.status == "pending" and self.thread is not None and self.thread.is_alive()
+
+
+class CubeAuth:
+    """Holds OAuth tokens for one user and vends Cube credentials."""
 
     def __init__(
         self,
@@ -78,6 +203,8 @@ class ConvoicarAuth:
         self._tokens_mtime = self._file_mtime()
         self._cube: Optional[dict] = None  # {endpoint, token, expires_at}
         self._user: Optional[dict] = None  # last-known identity
+        self._pending: Optional[_PendingLogin] = None  # login awaiting the browser round-trip
+        self._login_lock = threading.Lock()
 
     # -- token cache ---------------------------------------------------------
     @staticmethod
@@ -144,7 +271,7 @@ class ConvoicarAuth:
         try:
             resp = requests.post(f"{self.base_url}/oauth/token", data=data, timeout=_HTTP_TIMEOUT)
         except requests.RequestException as e:
-            raise AuthError(f"Could not reach Convoicar at {self.base_url} ({e}).")
+            raise AuthError(f"Could not reach the auth server at {self.base_url} ({e}).")
         if resp.status_code != 200:
             raise AuthError(f"Token endpoint returned HTTP {resp.status_code}: {resp.text[:300]}")
         payload = resp.json()
@@ -198,46 +325,108 @@ class ConvoicarAuth:
         return self._tokens["access_token"] if self._refresh() else None
 
     # -- browser login flow --------------------------------------------------
-    def login(self) -> dict:
-        """Run the interactive browser login. Returns the user identity dict."""
-        verifier, challenge = _pkce_pair()
-        state = secrets.token_urlsafe(24)
-        code = self._run_loopback_flow(challenge, state)
-        self._exchange_code(code, verifier)
-        self.refresh_session(force=True)  # confirm + cache the Cube token
-        return self._user or {}
+    def begin_login(self) -> dict:
+        """Start a login *without blocking*: bind the callback server, try to open the browser,
+        and hand the URL straight back. The round-trip finishes in a background thread, so a
+        client that cannot open a browser (stripped environment, container, remote MCP) can just
+        show the link to the user. Returns {url, opened, reused}."""
+        with self._login_lock:
+            pending = self._pending
+            if pending is not None and pending.running:
+                # A login is already waiting on the callback port — re-issue its URL rather than
+                # racing it for the port.
+                return {"url": pending.url, "opened": pending.opened, "reused": True}
 
-    def _run_loopback_flow(self, challenge: str, state: str) -> str:
+            verifier, challenge = _pkce_pair()
+            state = secrets.token_urlsafe(24)
+            server = self._bind_callback_server()
+            url = self._authorize_url(challenge, state)
+            pending = _PendingLogin(url=url, state=state, verifier=verifier, server=server)
+            pending.thread = threading.Thread(
+                target=self._complete_login,
+                args=(pending,),
+                name="mcp-cube-oauth-callback",
+                daemon=True,
+            )
+            self._pending = pending
+            # Listen first, open second: a browser that reaches the callback before anyone is
+            # serving it would sit there waiting for a response that never comes.
+            pending.thread.start()
+            pending.opened = open_browser(url, self.logger)
+
+            prefix = (
+                "Opening your browser to log in…"
+                if pending.opened
+                else "Open this URL to log in:"
+            )
+            # NEVER write to stdout here: inside the MCP server, stdout is the JSON-RPC channel
+            # and any stray text corrupts the protocol. stderr is safe (captured as logs) and also
+            # visible when running the `mcp-cube-login` command in a terminal.
+            print(f"{prefix}\n{url}\n", file=sys.stderr, flush=True)
+            return {"url": url, "opened": pending.opened, "reused": False}
+
+    def login(self, timeout: int = _LOGIN_TIMEOUT) -> dict:
+        """Blocking login, used by the `mcp-cube-login` terminal command. Returns the identity."""
+        self.begin_login()
+        pending = self._pending
+        if pending is None:  # pragma: no cover — begin_login always sets it
+            raise AuthError("Login could not be started.")
+        if pending.thread is not None:
+            pending.thread.join(timeout + 5)
+        if pending.status != "done":
+            raise AuthError(pending.error or "Timed out waiting for the browser login.")
+        return pending.user
+
+    def login_status(self) -> dict:
+        """Where the current login stands: {status: none|pending|done|failed, url, error, user}."""
+        pending = self._pending
+        if pending is not None and pending.status == "pending":
+            return {"status": "pending", "url": pending.url}
+        if self.is_authenticated():
+            return {"status": "done", "user": self._user or (pending.user if pending else {}) or {}}
+        if pending is not None:
+            return {"status": pending.status, "url": pending.url, "error": pending.error}
+        return {"status": "none"}
+
+    def _bind_callback_server(self) -> HTTPServer:
         try:
             server = HTTPServer(("127.0.0.1", self.port), _CallbackHandler)
         except OSError as e:
             raise AuthError(
                 f"Could not bind the local callback port {self.port} ({e}). "
-                "Close whatever is using it or set CONVOICAR_OAUTH_PORT."
+                "Close whatever is using it or set MCP_CUBE_OAUTH_PORT."
             )
         server.oauth_result = None  # type: ignore[attr-defined]
-        server.timeout = 1
-        url = self._authorize_url(challenge, state)
-        opened = webbrowser.open(url)
-        prefix = "Opening your browser to log in to Convoicar…" if opened else "Open this URL to log in to Convoicar:"
-        # NEVER write to stdout here: inside the MCP server, stdout is the JSON-RPC channel
-        # and any stray text corrupts the protocol. stderr is safe (captured as logs) and also
-        # visible when running the `mcp-cube-login` command in a terminal.
-        print(f"{prefix}\n{url}\n", file=sys.stderr, flush=True)
+        server.timeout = 1  # so handle_request() returns and the deadline stays enforceable
+        return server
 
-        deadline = time.time() + _LOGIN_TIMEOUT
+    def _complete_login(self, pending: _PendingLogin) -> None:
+        """Background half of the login: wait for the callback, then trade the code for tokens."""
         try:
-            while server.oauth_result is None:  # type: ignore[attr-defined]
-                if time.time() > deadline:
-                    raise AuthError("Timed out waiting for the browser login (5 min).")
-                server.handle_request()
+            code = self._wait_for_code(pending)
+            self._exchange_code(code, pending.verifier)
+            self.refresh_session(force=True)  # confirm + cache the Cube token
+            pending.user = self._user or {}
+            pending.status = "done"
+        except Exception as e:  # noqa: BLE001 — the thread must never die unnoticed
+            pending.status = "failed"
+            pending.error = str(e)
+            self.logger.warning("Login failed: %s", e)
         finally:
-            server.server_close()
+            pending.server.server_close()
+
+    def _wait_for_code(self, pending: _PendingLogin) -> str:
+        server = pending.server
+        deadline = time.time() + _LOGIN_TIMEOUT
+        while server.oauth_result is None:  # type: ignore[attr-defined]
+            if time.time() > deadline:
+                raise AuthError("Timed out waiting for the browser login (5 min).")
+            server.handle_request()
 
         result = server.oauth_result  # type: ignore[attr-defined]
         if result.get("error"):
             raise AuthError(f"Login failed: {result['error']} {result.get('error_description') or ''}".strip())
-        if result.get("state") != state:
+        if result.get("state") != pending.state:
             raise AuthError("OAuth state mismatch — aborting for safety.")
         if not result.get("code"):
             raise AuthError("No authorization code received.")
@@ -258,7 +447,7 @@ class ConvoicarAuth:
                 timeout=_HTTP_TIMEOUT,
             )
         except requests.RequestException as e:
-            raise AuthError(f"Could not reach Convoicar at {self.base_url} ({e}).")
+            raise AuthError(f"Could not reach the auth server at {self.base_url} ({e}).")
         if resp.status_code == 401:
             # Access token rejected: try one refresh, else force re-login.
             if self._refresh():
@@ -266,7 +455,7 @@ class ConvoicarAuth:
             self._clear_tokens()
             raise AuthError("Session expired — please log in again.")
         if resp.status_code != 200:
-            raise AuthError(f"Convoicar /mcp/session returned HTTP {resp.status_code}: {resp.text[:300]}")
+            raise AuthError(f"/mcp/session returned HTTP {resp.status_code}: {resp.text[:300]}")
         body = resp.json()
         cube = body.get("cube", {})
         self._user = body.get("user")
@@ -309,7 +498,7 @@ class ConvoicarAuth:
 
     def auth_error(self) -> str:
         return (
-            "Not logged in to Convoicar. Run the `mcp-cube-login` command in a terminal, "
+            "Not logged in. Run the `mcp-cube-login` command in a terminal, "
             "or call the `login` tool, then retry. All data tools stay locked until you are authenticated."
         )
 
@@ -346,16 +535,19 @@ class _CallbackHandler(BaseHTTPRequestHandler):
 # ---------------------------------------------------------------------------
 # Branded callback pages (self-contained: no external assets, CSP-safe)
 # ---------------------------------------------------------------------------
-# Convoicar brand palette (from convoicar/app/assets/stylesheets/variables.scss)
-_BRAND = "#27C3EB"        # Convoicar primary (cyan)
-_INK = "#211f2d"          # dark brand / logo glyph
-_SUCCESS = "#66BB6A"      # $brand-success
-_DANGER = "#d9534f"       # bootstrap danger
+_BRAND = "#27C3EB"        # accent (cyan)
+_INK = "#211f2d"          # text
+_SUCCESS = "#66BB6A"      # success green
+_DANGER = "#d9534f"       # error red
 
-# The Convoicar logo (cyan roundel with white C monogram), inlined as a data URI so the page
-# stays self-contained (no external assets, CSP-safe). Source: convoicar logo-convoicar.png,
-# trimmed and downscaled to 128px.
-_LOGO_DATA_URI = "data:image/png;base64,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"
+# Neutral cube mark, inlined as SVG so the page stays self-contained (no external assets, CSP-safe).
+_LOGO_SVG = (
+    '<svg class="logo" viewBox="0 0 64 64" role="img" aria-label="Cube" fill="none" '
+    f'stroke="{_BRAND}" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round">'
+    '<path d="M32 5 57 18.5v27L32 59 7 45.5v-27z"/>'
+    '<path d="M7 18.5 32 32l25-13.5M32 32v27"/>'
+    "</svg>"
+)
 
 _CHECK_ICON = (
     '<svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="3" stroke-linecap="round" '
@@ -396,7 +588,7 @@ def _page(title: str, icon: str, heading: str, message: str, accent: str, auto_c
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{title} · Convoicar</title>
+<title>{title}</title>
 <style>
   :root {{ color-scheme: light; }}
   * {{ box-sizing: border-box; margin: 0; padding: 0; }}
@@ -435,7 +627,7 @@ def _page(title: str, icon: str, heading: str, message: str, accent: str, auto_c
 <body>
   <main class="card">
     <div class="logo-wrap">
-      <img class="logo" src="{_LOGO_DATA_URI}" alt="Convoicar" width="84" height="84">
+      {_LOGO_SVG}
       <span class="pip">{icon}</span>
     </div>
     <h1>{heading}</h1>
@@ -451,7 +643,7 @@ def _success_page() -> str:
         title="Connexion réussie",
         icon=_CHECK_ICON,
         heading="Connexion réussie",
-        message="Vous êtes maintenant connecté à Convoicar. L'accès aux données analytiques est débloqué.",
+        message="Vous êtes maintenant connecté. L'accès aux données analytiques est débloqué.",
         accent=_SUCCESS,
         auto_close=True,
     )
@@ -471,11 +663,11 @@ def _error_page(result: dict) -> str:
 # ---------------------------------------------------------------------------
 # `mcp-cube-login` console command
 # ---------------------------------------------------------------------------
-def _auth_from_env() -> ConvoicarAuth:
-    return ConvoicarAuth(
-        base_url=os.getenv("CONVOICAR_URL") or DEFAULT_BASE_URL,
-        client_id=os.getenv("CONVOICAR_OAUTH_CLIENT_ID", DEFAULT_CLIENT_ID),
-        port=int(os.getenv("CONVOICAR_OAUTH_PORT", str(DEFAULT_PORT))),
+def _auth_from_env() -> CubeAuth:
+    return CubeAuth(
+        base_url=os.getenv("MCP_CUBE_URL") or DEFAULT_BASE_URL,
+        client_id=os.getenv("MCP_CUBE_OAUTH_CLIENT_ID", DEFAULT_CLIENT_ID),
+        port=int(os.getenv("MCP_CUBE_OAUTH_PORT", str(DEFAULT_PORT))),
     )
 
 
@@ -483,7 +675,7 @@ def login_cli() -> None:
     """Entry point for the `mcp-cube-login` command."""
     import argparse
 
-    parser = argparse.ArgumentParser(prog="mcp-cube-login", description="Log the Cube MCP into Convoicar.")
+    parser = argparse.ArgumentParser(prog="mcp-cube-login", description="Log the Cube MCP in.")
     parser.add_argument("--logout", action="store_true", help="Log out and clear cached credentials.")
     args = parser.parse_args()
 

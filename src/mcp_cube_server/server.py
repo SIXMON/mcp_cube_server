@@ -81,7 +81,7 @@ class CubeClient:
 
     def __init__(self, endpoint: Optional[str], api_secret: Optional[str], token_payload: dict,
                  logger: logging.Logger, auth=None):
-        # In auth mode (`auth` set) the Cube endpoint and JWT come from Convoicar per-user,
+        # In auth mode (`auth` set) the Cube endpoint and JWT come from the auth server per-user,
         # so this client never holds the Cube signing secret. In dev/standalone mode it signs
         # locally with `api_secret`, as before.
         self.auth = auth
@@ -109,7 +109,7 @@ class CubeClient:
 
     def _refresh_token(self):
         if self.auth is not None:
-            self.auth.invalidate_cube()  # force a fresh Cube token from Convoicar on next call
+            self.auth.invalidate_cube()  # force a fresh Cube token from the auth server on next call
         else:
             self.token = self._generate_token()
 
@@ -150,7 +150,7 @@ class CubeClient:
 
             # 401/403 is usually an auth problem (expired/missing token or missing security-context
             # claim), not an expiry of the query. Refresh the token (in auth mode this re-fetches a
-            # fresh Cube JWT from Convoicar) and retry once; if it still fails the caller sees the error.
+            # fresh Cube JWT from the auth server) and retry once; if it still fails the caller sees the error.
             if response.status_code in (401, 403):
                 self.logger.warning("%s from Cube — refreshing token and retrying once", response.status_code)
                 self._refresh_token()
@@ -164,7 +164,11 @@ class CubeClient:
             return payload
 
         except Exception as e:
-            self.logger.error("Request failed: %s", e)
+            # A requests exception embeds the full request URL — and the query, filter values
+            # included, travels as a URL parameter. The exception type plus the route says what
+            # broke without writing business data to a log that outlives the request.
+            self.logger.error("Request to %s failed: %s", route, type(e).__name__)
+            self.logger.debug("Request failure detail: %s", e)
             return {"error": f"Request failed: {e}"}
 
     # -- meta (cached) -------------------------------------------------------
@@ -616,6 +620,36 @@ def _aggregates(data: list[dict], annotation: dict, agg_map: dict) -> dict:
     return out
 
 
+def _redact_filters(filters: list) -> list:
+    """Strip the values out of a filter list, keeping member and operator.
+
+    Filter values are business data — a customer name, an email, an id — and logs outlive the
+    request: they go to stderr (captured by the MCP client) and to --log_dir. Member names and
+    operators are enough to reconstruct what a query did.
+    """
+    out = []
+    for entry in filters or []:
+        if not isinstance(entry, dict):
+            continue
+        if "and" in entry or "or" in entry:  # Cube's boolean groups nest filter lists
+            out.append({k: _redact_filters(v) if k in ("and", "or") else v for k, v in entry.items()})
+            continue
+        safe = {k: v for k, v in entry.items() if k != "values"}
+        values = entry.get("values")
+        if values is not None:
+            safe["values"] = f"<{len(values)} redacted>"
+        out.append(safe)
+    return out
+
+
+def _loggable_query(cube_query: dict) -> str:
+    """Serialize a query for the log: full structure, no filter values."""
+    safe = dict(cube_query)
+    if safe.get("filters"):
+        safe["filters"] = _redact_filters(safe["filters"])
+    return json.dumps(safe)
+
+
 def _write_result_file(data: list[dict], col_order: list[str], output_dir: str, fmt: str) -> str:
     """Write the full result to disk (csv/json) and return the absolute path.
     Results may contain sensitive data, so the directory is 0o700 and files 0o600."""
@@ -659,11 +693,11 @@ def main(credentials, logger, config=None, auth=None):
     page_size = int(config.get("page_size", 50_000))  # stays under Cube's per-query row cap
     max_export_rows = int(config.get("max_export_rows", 1_000_000))  # safety ceiling for a single export
 
-    mcp = FastMCP("Convoicar Cube")
+    mcp = FastMCP("Cube")
     client = CubeClient(**credentials, logger=logger, auth=auth)
 
-    # Gate: when authentication is enabled, no data tool runs until the user has logged in
-    # to Convoicar. Applied as the inner decorator so the tool FastMCP registers is the gated one.
+    # Gate: when authentication is enabled, no data tool runs until the user has logged in.
+    # Applied as the inner decorator so the tool FastMCP registers is the gated one.
     def require_auth(fn):
         @functools.wraps(fn)
         def wrapper(*args, **kwargs):
@@ -675,20 +709,52 @@ def main(credentials, logger, config=None, auth=None):
     # -- authentication tools -------------------------------------------------
     @mcp.tool("login")
     def login() -> str:
-        """Log in to Convoicar via your browser (SSO). Required before any data tool will run.
-        Opens the Convoicar login page; on success the Cube tools are unlocked for your account."""
+        """Log in via your browser (SSO). Required before any data tool will run.
+        Returns the login link and opens it automatically when this machine allows it; the login
+        then completes on its own, so always show the user the link rather than waiting here."""
         if auth is None:
             return "Authentication is disabled on this server (local/dev mode) — data tools are open."
+        if auth.is_authenticated():
+            user = auth.user() or {}
+            who = user.get("email") or user.get("name") or "this account"
+            return f"Already logged in as {who}. Call `logout` first to switch account."
         try:
-            user = auth.login()
+            info = auth.begin_login()
         except Exception as e:  # noqa: BLE001 — surface the reason to the user
             return f"Login failed: {e}"
-        who = user.get("email") or user.get("name") or f"user #{user.get('id')}"
-        return f"Logged in as {who}. Cube data tools are now unlocked."
+        # The URL is always returned: MCP clients start the server with a stripped environment,
+        # so the automatic browser launch cannot be relied on (and is impossible in a container).
+        head = (
+            "Your browser should have opened on the login page. If nothing appeared, open this link:"
+            if info["opened"]
+            else "I could not open a browser from here — open this link to log in:"
+        )
+        return (
+            f"{head}\n\n{info['url']}\n\n"
+            "The link is valid 5 minutes. Once the confirmation page appears the data tools "
+            "unlock by themselves — just retry your request, or call `login_status` to check."
+        )
+
+    @mcp.tool("login_status")
+    def login_status() -> str:
+        """Where the login stands: logged in, still waiting for the browser round-trip, or failed."""
+        if auth is None:
+            return "Authentication is disabled on this server (local/dev mode) — data tools are open."
+        state = auth.login_status()
+        status = state["status"]
+        if status == "done":
+            user = state.get("user") or {}
+            who = user.get("email") or user.get("name") or "your account"
+            return f"Logged in as {who}. Cube data tools are unlocked."
+        if status == "pending":
+            return f"Still waiting for the browser login. Open this link if you have not yet:\n\n{state['url']}"
+        if status == "failed":
+            return f"Login failed: {state.get('error')}. Call `login` to try again."
+        return "Not logged in. Call `login` to start the browser login."
 
     @mcp.tool("logout")
     def logout() -> str:
-        """Log out of Convoicar and lock all data tools until the next login."""
+        """Log out and lock all data tools until the next login."""
         if auth is None:
             return "Authentication is disabled on this server (local/dev mode)."
         auth.logout()
@@ -812,7 +878,7 @@ def main(credentials, logger, config=None, auth=None):
 
             # dry-run: compile to SQL, list members/cubes used, do not execute
             if query.dry_run:
-                logger.info("read_data dry_run: %s", json.dumps(cube_query))
+                logger.info("read_data dry_run: %s", _loggable_query(cube_query))
                 resp = client.sql(cube_query)
                 if error := resp.get("error"):
                     return f"Error (dry_run): {error}"
@@ -832,7 +898,7 @@ def main(credentials, logger, config=None, auth=None):
             # Large-export intent (limit None or above one page) → page through Cube's row cap
             # transparently into a single result, so the agent never has to merge files by hand.
             paginate = query.limit is None or query.limit > page_size
-            logger.info("read_data query=%s paginate=%s", json.dumps(cube_query), paginate)
+            logger.info("read_data query=%s paginate=%s", _loggable_query(cube_query), paginate)
             partial_error = None
             if paginate:
                 result = client.query_paginated(cube_query, page_size, max_export_rows)
@@ -845,7 +911,8 @@ def main(credentials, logger, config=None, auth=None):
             else:
                 response = client.query(cube_query)
                 if error := response.get("error"):
-                    logger.error("Error in read_data: %s\n\n%s", error, response.get("stack"))
+                    logger.error("Error in read_data: %s", error)
+                    logger.debug("Cube stack: %s", response.get("stack"))  # may echo SQL + parameters
                     return f"Error: {_explain_error(error)}"
                 data = response.get("data", [])
                 annotation = response.get("annotation", {})
