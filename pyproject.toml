@@ -6,6 +6,10 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "mcp>=1.2.1,<2",
+    # Transitive via mcp -> pyjwt[crypto]. Pinned below 49 because cryptography
+    # dropped the macosx universal2 wheels in 49.0.0 (arm64-only since then),
+    # which forces a source build (Rust toolchain) on Intel Macs.
+    "cryptography>=44,<49",
     "pyjwt>=2.10.1",
     "python-dotenv",
     "pyyaml>=6.0.2",
