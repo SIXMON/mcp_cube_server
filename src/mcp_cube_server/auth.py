@@ -671,6 +671,26 @@ def _auth_from_env() -> CubeAuth:
     )
 
 
+def use_system_certs(logger: logging.Logger | None = None) -> None:
+    """Verify TLS against the OS trust store instead of certifi's bundle.
+
+    Corporate proxies (Zscaler, Netskope, ...) re-sign HTTPS traffic with a private
+    root CA that is installed in the OS store but absent from certifi, so every
+    `requests` call fails with CERTIFICATE_VERIFY_FAILED. `truststore` routes
+    verification through the platform store, the same way `uv --system-certs` does.
+    An explicit SSL_CERT_FILE / REQUESTS_CA_BUNDLE always wins.
+    """
+    if os.getenv("SSL_CERT_FILE") or os.getenv("REQUESTS_CA_BUNDLE"):
+        return
+    try:
+        import truststore
+
+        truststore.inject_into_ssl()
+    except Exception as e:  # pragma: no cover - falls back to certifi
+        if logger:
+            logger.debug("OS trust store unavailable, falling back to certifi: %s", e)
+
+
 def login_cli() -> None:
     """Entry point for the `mcp-cube-login` command."""
     import argparse
@@ -679,6 +699,7 @@ def login_cli() -> None:
     parser.add_argument("--logout", action="store_true", help="Log out and clear cached credentials.")
     args = parser.parse_args()
 
+    use_system_certs()
     auth = _auth_from_env()
     if args.logout:
         auth.logout()

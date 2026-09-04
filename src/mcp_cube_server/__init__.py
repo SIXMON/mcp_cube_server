@@ -7,7 +7,13 @@ import os
 import dotenv
 
 from . import server
-from .auth import CubeAuth, DEFAULT_BASE_URL, DEFAULT_CLIENT_ID, DEFAULT_PORT
+from .auth import (
+    CubeAuth,
+    DEFAULT_BASE_URL,
+    DEFAULT_CLIENT_ID,
+    DEFAULT_PORT,
+    use_system_certs,
+)
 
 
 def _truthy(value):
@@ -97,6 +103,8 @@ def main():
     )
     console_handler.setFormatter(formatter)
     logger.addHandler(console_handler)
+
+    use_system_certs(logger)
 
     if args.log_dir:
         file_handler = logging.FileHandler(

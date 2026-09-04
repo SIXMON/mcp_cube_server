@@ -14,6 +14,9 @@ dependencies = [
     "python-dotenv",
     "pyyaml>=6.0.2",
     "requests>=2.32.3",
+    # Verify TLS against the OS trust store, so corporate proxies that re-sign
+    # HTTPS with a private root CA (absent from certifi) do not break every call.
+    "truststore>=0.10",
 ]
 
 [build-system]
